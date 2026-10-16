@@ -275,6 +275,7 @@ CLI 的每个命令都**只输出一个 JSON 对象**，所以 AI 可以直接�
 | `run <strategy>` | 策略单次执行 |
 | `watch <strategy>` | 策略循环（有上限） |
 | `grid ladder` | 打印网格价目表 |
+| `simulate` | **离线跑模拟交易日**：三种行情下网格赚不赚、手续费吃掉多少 |
 | `audit [--tail N]` | 审计日志 |
 
 策略：`grid`（等比网格）、`t`（底仓做 T）。

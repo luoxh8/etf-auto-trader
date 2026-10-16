@@ -6,28 +6,39 @@ arithmetic grid would be too dense low and too sparse high).
 
 State model
 -----------
-The grid keeps a ``base`` price and a set of filled levels per side. On each
-call it looks at the current price and emits at most one order per crossed
-level, then records the fill in ``state`` so the next call does not repeat it.
-State is a plain dict, persisted by the CLI to ``var/grid-<code>.json``.
+Each level has a **two-state latch** and re-arms automatically, which is what
+makes the grid repeat instead of firing once:
+
+* a *buy* level (below the anchor) is ``idle`` until price crosses **down**
+  through it, then it buys and latches ``long``; when price crosses back **up**
+  through it, it sells that lot and returns to ``idle``.
+* a *sell* level (above the anchor) is ``idle`` until price crosses **up**
+  through it, then it sells and latches ``short``; when price crosses back
+  **down** through it, it buys that lot back and returns to ``idle``.
+
+The previous implementation recorded a level as done forever, so the grid
+traded once and then went dead — found by ``etfa simulate``, which is exactly
+what that tool is for.
 
 Cost awareness
 --------------
-A grid only makes money if the spacing clears round-trip friction. This class
-does not enforce that (the risk guard and docs do); but ``min_spacing_pct``
-default of 2.0% exists because with a ¥5 minimum commission, spacing below
-~2% nets almost nothing on small tickets — see docs/COSTS.md.
+A grid only makes money if the spacing clears round-trip friction. With a ¥5
+minimum commission, spacing below ~2% nets almost nothing on small tickets —
+see docs/COSTS.md and run ``etfa simulate`` to see it on your own numbers.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..models import OrderRequest, SIDE_BUY, SIDE_SELL
 from .base import Strategy, StrategyContext
+
+IDLE = 0
+LONG = 1    # a buy level that bought and is waiting to sell that lot back
+SHORT = -1  # a sell level that sold and is waiting to buy that lot back
 
 
 @dataclass
@@ -37,7 +48,7 @@ class GridParams:
     spacing_pct: float = 3.0       # percent between adjacent levels
     levels_up: int = 4             # number of sell levels above base
     levels_down: int = 4           # number of buy levels below base
-    qty_per_level: int = 2800      # shares per level (2800 @ ~1.09 ≈ ¥3050)
+    qty_per_level: int = 2800      # shares per level
     lower_bound: float = 0.0       # optional hard floor (0 = derived from levels)
     upper_bound: float = 0.0       # optional hard ceiling
 
@@ -65,8 +76,10 @@ class GridStrategy(Strategy):
         if spacing_pct <= 0:
             raise ValueError("spacing_pct must be > 0")
         self.state_path = Path(state_path) if state_path else None
-        # filled[side] = set of level indices already acted on, as strings
-        self.state: Dict[str, List[int]] = {"buy": [], "sell": []}
+        # latch per level: 0 idle, LONG for a buy level holding a lot,
+        # SHORT for a sell level having sold a lot it must buy back.
+        self.buy_state: List[int] = [IDLE] * self.params.levels_down
+        self.sell_state: List[int] = [IDLE] * self.params.levels_up
 
     # ---- level maths (pure, exposed for tests) ---------------------------
 
@@ -93,6 +106,24 @@ class GridStrategy(Strategy):
     # ---- planning --------------------------------------------------------
 
     def plan(self, ctx: StrategyContext) -> List[OrderRequest]:
+        """Return at most one intent per call.
+
+        Semantics are **level-based with an auto-unlatching latch**, which is
+        what makes the grid repeat:
+
+        * a buy level below the anchor: while ``state == IDLE`` and price is at
+          or below the level, buy and latch ``LONG``; while ``LONG`` and price
+          rises back above the level, sell that lot and unlatch to ``IDLE``.
+        * a sell level above the anchor: while ``IDLE`` and price is at or above
+          the level, sell and latch ``SHORT``; while ``SHORT`` and price falls
+          back below, buy the lot back and unlatch.
+
+        The earlier implementation recorded a level as "done" forever, so the
+        grid traded once and then went dead. `etfa simulate` caught that. A
+        first attempt to fix it with price-crossing detection needed the
+        previous tick and mis-handled an exact touch of a level; the latch
+        above needs neither and re-arms naturally.
+        """
         p = self.params
         q = ctx.quote(p.code)
         if q is None or q.last <= 0:
@@ -104,45 +135,62 @@ class GridStrategy(Strategy):
         if p.upper_bound and price > p.upper_bound:
             return []
 
-        done_buy = set(self.state.get("buy", []))
-        done_sell = set(self.state.get("sell", []))
-        orders: List[OrderRequest] = []
-
         sellable = ctx.sellable(p.code)
         cash = ctx.cash_available
+        orders: List[OrderRequest] = []
 
-        # price dropped through a buy level -> want to BUY (if we can afford it)
+        # BUY levels (below anchor): buy the dip, sell the lot back on recovery.
         for idx, lvl in enumerate(self.buy_levels()):
-            if price <= lvl and idx not in done_buy:
-                cost = p.qty_per_level * lvl
-                if cost <= cash:
+            if self.buy_state[idx] == IDLE:
+                if price <= lvl and p.qty_per_level * lvl <= cash:
+                    self.buy_state[idx] = LONG
                     orders.append(OrderRequest(code=p.code, side=SIDE_BUY, qty=p.qty_per_level,
                                                price=lvl, reason=f"grid buy L{idx + 1} @ {lvl}"))
-                    self.state.setdefault("buy", []).append(idx)
-                    cash -= cost
-                break  # one level per call keeps behaviour predictable
-        else:
-            # price rose through a sell level -> want to SELL settled shares
-            for idx, lvl in enumerate(self.sell_levels()):
-                if price >= lvl and idx not in done_sell:
-                    if sellable >= p.qty_per_level:
-                        orders.append(OrderRequest(code=p.code, side=SIDE_SELL, qty=p.qty_per_level,
-                                                   price=lvl, reason=f"grid sell L{idx + 1} @ {lvl}"))
-                        self.state.setdefault("sell", []).append(idx)
-                    break
+                    return orders
+            elif self.buy_state[idx] == LONG:
+                if price > lvl and sellable >= p.qty_per_level:
+                    self.buy_state[idx] = IDLE
+                    orders.append(OrderRequest(code=p.code, side=SIDE_SELL, qty=p.qty_per_level,
+                                               price=lvl, reason=f"grid take-profit L{idx + 1} @ {lvl}"))
+                    return orders
+
+        # SELL levels (above anchor): sell the rip, buy the lot back on pullback.
+        for idx, lvl in enumerate(self.sell_levels()):
+            if self.sell_state[idx] == IDLE:
+                if price >= lvl and sellable >= p.qty_per_level:
+                    self.sell_state[idx] = SHORT
+                    orders.append(OrderRequest(code=p.code, side=SIDE_SELL, qty=p.qty_per_level,
+                                               price=lvl, reason=f"grid sell H{idx + 1} @ {lvl}"))
+                    return orders
+            elif self.sell_state[idx] == SHORT:
+                if price < lvl and p.qty_per_level * lvl <= cash:
+                    self.sell_state[idx] = IDLE
+                    orders.append(OrderRequest(code=p.code, side=SIDE_BUY, qty=p.qty_per_level,
+                                               price=lvl, reason=f"grid buy-back H{idx + 1} @ {lvl}"))
+                    return orders
 
         return orders
 
     # ---- persistence -----------------------------------------------------
 
     def dump_state(self) -> dict:
-        return {"state": self.state, "params": self.params.__dict__}
+        return {
+            "buy_state": list(self.buy_state),
+            "sell_state": list(self.sell_state),
+            "params": self.params.__dict__,
+        }
 
     def load_state(self, state: dict) -> None:
         if not state:
             return
-        self.state = {"buy": list(state.get("state", {}).get("buy", [])),
-                      "sell": list(state.get("state", {}).get("sell", []))}
+        bs = state.get("buy_state")
+        ss = state.get("sell_state")
+        if isinstance(bs, list) and len(bs) == len(self.buy_state):
+            self.buy_state = [int(x) for x in bs]
+        if isinstance(ss, list) and len(ss) == len(self.sell_state):
+            self.sell_state = [int(x) for x in ss]
 
     def reset(self) -> None:
-        self.state = {"buy": [], "sell": []}
+        self.buy_state = [IDLE] * self.params.levels_down
+        self.sell_state = [IDLE] * self.params.levels_up
+

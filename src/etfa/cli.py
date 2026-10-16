@@ -442,6 +442,73 @@ def cmd_probe(app: App, args) -> None:
     ok(broker=app.adapter.name, verdict=verdict, raw=raw)
 
 
+def cmd_simulate(app: App, args) -> None:
+    """Run the grid strategy over a synthetic price path, offline.
+
+    Answers "does this grid survive a session, net of the ¥5 minimum commission?"
+    without touching a broker. The strategy and risk guard are the shipped ones.
+    """
+    from .simulate import CostModel, compare_cost_regimes, make_price_path, simulate_grid
+
+    cost = CostModel(
+        commission_rate=args.commission_rate,
+        min_commission=0.0 if args.no_min_commission else args.min_commission,
+    )
+    common = dict(
+        code=args.code,
+        base_price=args.base,
+        spacing_pct=args.spacing,
+        qty_per_level=args.qty,
+        levels_up=args.levels_up,
+        levels_down=args.levels_down,
+        starting_cash=args.cash,
+        starting_position=args.position or int(args.cash * 0.4 / args.base // 100 * 100),
+        ticks=args.ticks,
+        seed=args.seed,
+    )
+
+    if args.compare_fees:
+        # compare_cost_regimes builds its own two CostModels; it must not also
+        # receive ours (that collided on the `cost` keyword)
+        out = compare_cost_regimes(
+            commission_rate=args.commission_rate,
+            min_commission=args.min_commission,
+            **common,
+        )
+        ok(**out)
+        return
+
+    if args.scenario == "all":
+        results = {}
+        for sc in ("range", "up", "down"):
+            results[sc] = simulate_grid(scenario=sc, cost=cost, **common).to_dict()
+        ok(scenarios=results, costs=cost.describe(),
+           verdict=_sim_verdict(results))
+        return
+
+    res = simulate_grid(scenario=args.scenario, cost=cost, **common)
+    ok(**res.to_dict(), costs=cost.describe())
+
+
+def _sim_verdict(results: Dict[str, Any]) -> Dict[str, Any]:
+    """A blunt read of the three-scenario sweep, so an AI need not interpret."""
+    rng = results.get("range", {})
+    up = results.get("up", {})
+    down = results.get("down", {})
+    return {
+        "range_net_pnl": rng.get("net_pnl"),
+        "up_net_pnl": up.get("net_pnl"),
+        "down_net_pnl": down.get("net_pnl"),
+        "profitable_in_range": (rng.get("net_pnl") or 0) > 0,
+        "worst_case": min((v.get("net_pnl") or 0) for v in results.values()),
+        "reminder": (
+            "A grid earns in the ranging case and loses in the trending cases. "
+            "Read 'down' as 'how much would I lose if it just kept falling' — that "
+            "is the risk you are accepting by running one."
+        ),
+    }
+
+
 def cmd_audit(app: App, args) -> None:
     events = app.audit.tail(args.tail)
     ok(events=events, count=len(events), notional_today=app.audit.notional_today())
@@ -605,6 +672,29 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("audit", help="recent audit events")
     sp.add_argument("--tail", type=int, default=20)
     sp.set_defaults(func=cmd_audit)
+
+    sp = sub.add_parser("simulate", help="run the grid over a synthetic price path (offline, no broker)")
+    sp.add_argument("--code", default="513050")
+    sp.add_argument("--base", type=float, default=1.092, help="anchor price")
+    sp.add_argument("--spacing", type=float, default=3.0, help="%% between levels")
+    sp.add_argument("--qty", type=int, default=2800, help="shares per level")
+    sp.add_argument("--levels-up", type=int, default=4, dest="levels_up")
+    sp.add_argument("--levels-down", type=int, default=4, dest="levels_down")
+    sp.add_argument("--cash", type=float, default=50000.0, help="starting cash")
+    sp.add_argument("--position", type=int, default=0, help="starting shares (default: 40%% of cash)")
+    sp.add_argument("--ticks", type=int, default=480, help="number of price ticks")
+    sp.add_argument("--scenario", choices=["range", "up", "down", "all"], default="all",
+                    help="price regime; 'all' runs all three and compares")
+    sp.add_argument("--commission-rate", type=float, default=0.00015, dest="commission_rate",
+                    help="per-side commission rate (0.00015 = 万1.5)")
+    sp.add_argument("--min-commission", type=float, default=5.0, dest="min_commission",
+                    help="per-order minimum commission (¥5 typical)")
+    sp.add_argument("--no-min-commission", action="store_true", dest="no_min_commission",
+                    help="model the case where the broker waives the ¥5 minimum ('免5')")
+    sp.add_argument("--compare-fees", action="store_true", dest="compare_fees",
+                    help="run with and without the minimum fee, side by side")
+    sp.add_argument("--seed", type=int, default=7)
+    sp.set_defaults(func=cmd_simulate)
 
     return p
 

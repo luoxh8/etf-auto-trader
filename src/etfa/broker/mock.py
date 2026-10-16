@@ -38,11 +38,15 @@ class MockBroker(BrokerAdapter):
     name = "mock"
 
     def __init__(self, seed: Optional[dict] = None, fill_immediately: bool = True,
-                 persist_path: Optional[str] = None):
+                 persist_path: Optional[str] = None, t0: bool = False):
         seed = seed or {}
         self.cash: float = float(seed.get("cash", 50000.0))
         self._connected = False
         self.fill_immediately = fill_immediately
+        # t0=True models a T+0 fund (cross-border/bond/gold ETF): shares bought
+        # today are immediately sellable, which is what makes intraday round
+        # trips possible. The default (False) models a T+1 fund.
+        self.t0 = t0
         self._prices: Dict[str, float] = dict(seed.get("prices", {"513050": 1.092}))
         self._names: Dict[str, str] = dict(seed.get("names", {"513050": "中概互联网ETF易方达"}))
         self._positions: Dict[str, Position] = {}
@@ -181,7 +185,9 @@ class MockBroker(BrokerAdapter):
                     total_cost = pos.cost * pos.qty + cost
                     pos.qty += qty
                     pos.cost = round(total_cost / pos.qty, 4) if pos.qty else 0.0
-                    # T+1: today's buy is NOT sellable today
+                    # T+1: today's buy is NOT sellable today; T+0: it is
+                    if self.t0:
+                        pos.available += qty
                     order.filled = qty
                     order.status = STATUS_FILLED
             else:  # sell
