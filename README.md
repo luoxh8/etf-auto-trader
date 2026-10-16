@@ -137,7 +137,25 @@ D:\codex_proj\dev\toolchains\python\runtime\python.exe -m venv .venv
 > 先向国元客服（**95578**）确认「是否支持用同花顺客户端登录交易」。
 > 早年国元曾以「登记委托来源」为由不支持第三方客户端，现状以客服口径为准。
 
-### 第 3 步：找到客户端 exe 路径
+### 第 3 步（推荐）：跑一键接线脚本
+
+装好并登录后，**不用手动找路径、不用手改配置**：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\onboard.ps1
+```
+
+它会自动：① 全盘搜出 `xiadan.exe`；② 把它写进 `config/config.json` 的 `exe_path`；
+③ 依次跑 `doctor` → `status --connect` → **`probe`**。
+
+**最后看 `probe` 的输出就是结论**：`readable:true` 且 `fields_missing:[]` → 兼容可用。
+（想手动指定路径：`-ExePath "C:\国元远航\xiadan.exe"`。只想搜不写配置：跑 `scripts\find-client.ps1`。）
+
+如果你更想手工做，跳过这步、走下面的第 4~6 步。
+
+### 第 4 步：找到客户端 exe 路径（手工路线）
+
+> 若已跑过 `scripts\onboard.ps1`，这一步与第 5 步都已自动完成，直接跳到第 6 步。
 
 在任务管理器里找到 `xiadan.exe`（同花顺下单程序）的路径，例如：
 
@@ -145,7 +163,7 @@ D:\codex_proj\dev\toolchains\python\runtime\python.exe -m venv .venv
 C:\国元远航\xiadan.exe
 ```
 
-### 第 4 步：改配置
+### 第 5 步：改配置
 
 ```powershell
 Copy-Item config\config.example.json config\config.json
@@ -171,7 +189,7 @@ Copy-Item config\config.example.json config\config.json
 }
 ```
 
-### 第 5 步：验证连接
+### 第 6 步：验证连接
 
 ```powershell
 .\.venv\Scripts\python.exe -m etfa doctor
@@ -197,7 +215,7 @@ Copy-Item config\config.example.json config\config.json
   `columns_returned` 发给作者/贴 issue 就能加映射。
 - `readable: false` → 见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
-### 第 6 步：先小额实盘验证
+### 第 7 步：先小额实盘验证
 
 ```powershell
 # 先干跑，确认价格和数量算对了
