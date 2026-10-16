@@ -73,14 +73,19 @@ def _to_int(v: Any) -> int:
 class EasytraderThsBroker(BrokerAdapter):
     name = "easytrader_ths"
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, trader: Any = None):
         self.cfg = cfg
-        self._user: Any = None        # easytrader.use(...) result
-        self._connected = False
+        # `trader` lets tests inject a stand-in for easytrader's ClientTrader;
+        # in production it is built lazily in connect().
+        self._user: Any = trader
+        self._connected = bool(trader)
 
     # ---- connection -------------------------------------------------------
 
     def connect(self) -> None:
+        if self._user is not None:
+            self._connected = True
+            return
         try:
             import easytrader  # type: ignore
         except ImportError as exc:  # pragma: no cover - exercised only when missing
@@ -119,7 +124,10 @@ class EasytraderThsBroker(BrokerAdapter):
                     "clienttype='universal_client' needs broker.user and the password in "
                     f"the ${self.cfg.broker.password_env} environment variable"
                 )
-            self._user.prepare(user=user, password=password, exe_path=self.cfg.broker.exe_path)
+            try:
+                self._user.prepare(user=user, password=password, exe_path=self.cfg.broker.exe_path)
+            except Exception as exc:  # noqa: BLE001
+                raise NotConnected(f"universal_client login failed: {exc}") from exc
 
         self._require_capability("balance")
         self._connected = True
@@ -142,17 +150,40 @@ class EasytraderThsBroker(BrokerAdapter):
             )
 
     def _call(self, method: str, *args, **kwargs) -> Any:
+        """Invoke a *method* capability (buy/sell/cancel/connect)."""
         self._require_capability(method)
         fn = getattr(self._user, method)
+        if not callable(fn):
+            raise UnsupportedFeature(
+                f"easytrader attribute '{method}' is not callable on this client"
+            )
         try:
             return fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
             raise BrokerError(f"easytrader {method} failed: {exc}") from exc
 
+    def _attr(self, name: str) -> Any:
+        """Read a capability that easytrader exposes EITHER as a property or a method.
+
+        This matters: in easytrader 0.23.7 `balance`, `position`, `today_entrusts`
+        and `cancel_entrusts` are *properties* (verified by introspection), so
+        `getattr` already returns the value. Some subclasses wrap them in
+        methods instead. Handle both so a client that differs does not crash us
+        with "'dict' object is not callable".
+        """
+        self._require_capability(name)
+        value = getattr(self._user, name)
+        if callable(value):
+            try:
+                return value()
+            except Exception as exc:  # noqa: BLE001
+                raise BrokerError(f"easytrader {name}() failed: {exc}") from exc
+        return value
+
     # ---- reads ------------------------------------------------------------
 
     def balance(self) -> Balance:
-        raw = self._call("balance")
+        raw = self._attr("balance")
         if isinstance(raw, list):
             raw = raw[0] if raw else {}
         raw = raw or {}
@@ -164,12 +195,12 @@ class EasytraderThsBroker(BrokerAdapter):
         return Balance(cash=cash, available=available, market_value=mv, total=total, frozen=frozen)
 
     def positions(self) -> List[Position]:
-        raw = self._call("position")
+        raw = self._attr("position")
         out: List[Position] = []
         for row in raw or []:
             if not isinstance(row, dict):
                 continue
-            code = str(_pick(row, "证券代码", "股票代码", "code", "证券代码/名称", default="")).strip()
+            code = str(_pick(row, "证券代码", "股票代码", "code", default="")).strip()
             if not code:
                 continue
             out.append(
@@ -185,12 +216,13 @@ class EasytraderThsBroker(BrokerAdapter):
         return out
 
     def quote(self, codes: List[str]) -> Dict[str, Quote]:
-        """Best-effort: easytrader exposes no uniform quote feed.
+        """Best-effort, and honest about its limits.
 
-        We read prices off the position/balance snapshot the client already
-        has (market price column). If a code is not held, callers must pass an
-        explicit ``--price``. This keeps the adapter honest: it never invents
-        a price.
+        easytrader exposes **no quote feed** (verified: ClientTrader has no
+        price/quote method; only market_buy/market_sell). The only price the
+        client already knows is the market-price column of the position grid,
+        so we read that. A code that is not held therefore has NO quote here —
+        callers must supply an explicit price (CLI: --price).
         """
         by_code = {p.code: p for p in self.positions()}
         out: Dict[str, Quote] = {}
@@ -201,9 +233,7 @@ class EasytraderThsBroker(BrokerAdapter):
         return out
 
     def orders(self, open_only: bool = False) -> List[Order]:
-        if not hasattr(self._user, "today_entrusts"):
-            raise UnsupportedFeature("this easytrader clienttype has no today_entrusts()")
-        raw = self._call("today_entrusts")
+        raw = self._attr("today_entrusts")
         out: List[Order] = []
         for row in raw or []:
             if not isinstance(row, dict):
@@ -229,13 +259,12 @@ class EasytraderThsBroker(BrokerAdapter):
     # ---- writes -----------------------------------------------------------
 
     def buy(self, code: str, price: float, qty: int) -> Order:
-        result: Any = None
-        # easytrader ths: buy(security, price, amount)
-        result = self._call("buy", code, price=price, amount=qty)
+        # signature is buy(self, security, price, amount) -> pass positionally
+        result = self._call("buy", code, price, qty)
         return _order_from_result(result, code, SIDE_BUY, price, qty)
 
     def sell(self, code: str, price: float, qty: int) -> Order:
-        result = self._call("sell", code, price=price, amount=qty)
+        result = self._call("sell", code, price, qty)
         return _order_from_result(result, code, SIDE_SELL, price, qty)
 
     def cancel(self, order_id: Optional[str] = None) -> List[str]:

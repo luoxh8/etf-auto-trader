@@ -27,7 +27,7 @@ from .audit import AuditEvent, AuditLog
 from .broker import get_adapter
 from .config import Config, load_config
 from .errors import EtfaError, RiskRejected, TradingHoursError
-from .models import OrderRequest, SIDE_BUY, SIDE_SELL, now_iso
+from .models import OrderRequest, Quote, SIDE_BUY, SIDE_SELL, now_iso
 from .risk import RiskGuard
 from .strategies import build as build_strategy
 from .strategies.base import StrategyContext
@@ -85,12 +85,21 @@ class App:
     def note(self, kind: str, **kw: Any) -> None:
         self.audit.append(AuditEvent(ts=now_iso(), kind=kind, **kw))
 
-    def context(self, codes: List[str]) -> StrategyContext:
+    def context(self, codes: List[str], price_override: Optional[float] = None) -> StrategyContext:
         quotes = {}
         try:
             quotes = self.adapter.quote(codes)
         except EtfaError:
             quotes = {}
+        # easytrader has no quote feed, so a code that is not held comes back
+        # with no price. An explicit --price lets strategies run anyway.
+        if price_override and price_override > 0:
+            for c in codes:
+                if c not in quotes:
+                    quotes[c] = Quote(code=c, last=round(price_override, 3),
+                                      bid1=round(price_override - 0.001, 3),
+                                      ask1=round(price_override + 0.001, 3),
+                                      prev_close=round(price_override, 3), ts=now_iso())
         try:
             positions = self.adapter.position_map()
         except EtfaError:
@@ -298,7 +307,7 @@ def cmd_plan(app: App, args) -> None:
     strat = _strategy_from_args(args)
     sf = _state_file(app, strat.name, args.code)
     _load_state(strat, sf)
-    ctx = app.context([args.code])
+    ctx = app.context([args.code], price_override=args.price)
     reqs = strat.plan(ctx)
     decisions = []
     for r in reqs:
@@ -318,7 +327,7 @@ def cmd_run(app: App, args) -> None:
     strat = _strategy_from_args(args)
     sf = _state_file(app, strat.name, args.code)
     _load_state(strat, sf)
-    ctx = app.context([args.code])
+    ctx = app.context([args.code], price_override=args.price)
     reqs = strat.plan(ctx)
     results = []
     for r in reqs:
@@ -340,7 +349,7 @@ def cmd_watch(app: App, args) -> None:
     placed_total = 0
     ticks = []
     for i in range(iterations):
-        ctx = app.context([args.code])
+        ctx = app.context([args.code], price_override=args.price)
         reqs = strat.plan(ctx)
         row = {"tick": i + 1, "ts": now_iso(), "session": ctx.session_label,
                "price": (ctx.quote(args.code).last if ctx.quote(args.code) else None),
@@ -495,6 +504,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--upper", type=float, default=0.0, help="grid: hard upper bound")
         sp.add_argument("--trigger", type=float, default=1.5, help="t: %% move from reference")
         sp.add_argument("--take-profit", type=float, default=1.5, dest="take_profit", help="t: %% to close a leg")
+        sp.add_argument("--price", type=float, default=0.0,
+                        help="override the current price. Needed when the broker has no quote "
+                             "feed (easytrader) and the code is not held.")
         sp.add_argument("--t0", action=argparse.BooleanOptionalAction, default=True,
                         help="t: fund is T+0 (allows 正T); use --no-t0 for T+1 funds")
         sp.add_argument("--force", action="store_true")

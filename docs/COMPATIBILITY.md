@@ -43,7 +43,52 @@ easytrader 为每个券商实现了控件定位类。国元远航虽是同花顺
 缺能力时抛 `UnsupportedFeature`，并明确告诉你缺哪个方法，
 而不是在订单中途莫名其妙失败。
 
+## easytrader 0.23.7 的真实接口（已用内省核实，2026-10-16）
+
+这些事实来自对本机已安装的 easytrader 做 `inspect`，不是猜测。
+**写适配器时必须按这个来**：
+
+| 成员 | 真实形态 | 说明 |
+|---|---|---|
+| `balance` / `position` / `today_entrusts` / `today_trades` / `cancel_entrusts` | **property**（属性） | **不是方法**！写成 `.balance()` 会 `TypeError: 'dict' object is not callable` |
+| `connect(exe_path=None)` | 方法 | 附着到已登录客户端 |
+| `buy(security, price, amount)` | 方法 | 三个**位置参数** |
+| `sell(security, price, amount)` | 方法 | 同上 |
+| `cancel_entrust(entrust_no)` | 方法 | 按委托编号撤单 |
+| `cancel_all_entrusts()` | 方法 | 全撤 |
+| `prepare(user=, password=, exe_path=, config_path=)` | 方法 | 仅 `universal_client` 系子类有 |
+
+`easytrader.use()` 的取值：`ths` / `universal_client` / `gj_client` / `ht_client` /
+`htzq_client` / `yh_client` / `gf_client` / `wk_client` / `miniqmt` / `xq`。
+`ths` 返回的是通用 `ClientTrader`。
+
+## 两个由客户端能力决定的功能限制
+
+### 1. 没有行情接口 → 价格从持仓表读，或由你指定
+
+`ClientTrader` **没有任何行情/报价方法**（只有 `market_buy` / `market_sell`，
+那是市价委托而不是行情）。本项目因此：
+
+- `quote` 只能从**持仓表里的「市价」列**读出你**已持有**标的的价格；
+- **未持有的代码没有价格** → 策略命令要显式给 `--price`：
+
+```powershell
+etfa plan grid --code 513050 --base 1.092 --spacing 3 --qty 2800 --price 1.095
+```
+
+如果你要更准的行情，在策略之外接一个数据源（akshare / easyquotation）再传 `--price`。
+
+### 2. 参考价用「最新价」而不是买卖盘口
+
+因为拿不到盘口，实盘路径的委托价用**最新价（last）**，而不是 mock 路径的
+买一/卖一价。**后果**：行情跳动快时，限价单可能挂不上而不成交。
+如果想更激进成交，就在命令里显式 `--price` 给一个更靠盘口的价格。
+
+> 这两条也是为什么 `mock` 适配器**故意**提供 bid1/ask1 —— 它模拟的是理想情况，
+> 用来验证策略逻辑；实盘的行为按本条受限。
+
 ## 排查步骤
+
 
 ### 1. 确认进程与内核
 
