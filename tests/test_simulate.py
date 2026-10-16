@@ -140,3 +140,58 @@ def test_simulate_t_fees_are_charged_per_leg():
     assert res.fees_paid >= 5.0 * legs * 0.9, (
         f"fees {res.fees_paid} look too low for {legs} legs"
     )
+
+
+# ---- broker-App form conversion ----------------------------------------
+
+def test_grid_app_form_reports_the_range_a_form_wants():
+    from etfa.simulate import grid_app_form
+
+    out = grid_app_form(base_price=1.011, spacing_pct=3.0,
+                        levels_up=4, levels_down=4, qty_per_level=2800)
+    f = out["app_form"]
+    assert f["lower_bound"] < 1.011 < f["upper_bound"]
+    assert f["grid_count"] == 8
+    assert f["qty_per_grid"] == 2800
+    # the range must match the geometric ladder it was derived from
+    assert f["lower_bound"] == out["ladders"]["geometric_this_project"][0]
+    assert f["upper_bound"] == out["ladders"]["geometric_this_project"][-1]
+
+
+def test_grid_app_form_quantifies_the_geometric_vs_arithmetic_gap():
+    """A broker grid form lays out EQUAL PRICE steps; our strategy uses EQUAL
+    PERCENT steps. Over a wide range they diverge, and a user who hand-places
+    our geometric levels alongside the App's arithmetic ones would double up."""
+    from etfa.simulate import grid_app_form
+
+    out = grid_app_form(base_price=1.011, spacing_pct=3.0, levels_up=4, levels_down=4)
+    lad = out["ladders"]
+    assert len(lad["geometric_this_project"]) == len(lad["arithmetic_app_likely"]) == 9
+    assert lad["max_deviation"] > 0, "the two ladders should differ over an 8-grid range"
+    assert any("arithmetic" in w and "geometric" in w for w in out["warnings"])
+
+
+def test_grid_app_form_flags_cheap_spacing_and_fee_drag():
+    from etfa.simulate import grid_app_form
+
+    tight = grid_app_form(base_price=1.0, spacing_pct=1.5, qty_per_level=2800)
+    assert any("below 2%" in w for w in tight["warnings"])
+
+    # This figure is the fee share of ONE round trip (NOT cumulative fees vs
+    # cumulative P&L, which is what makes the simulator show a net loss over a
+    # session). The meaningful claim is that it rises as spacing tightens.
+    wide = grid_app_form(base_price=1.0, spacing_pct=3.0, qty_per_level=2800)
+    assert tight["fees"]["fee_share_of_spacing_pct"] > wide["fees"]["fee_share_of_spacing_pct"]
+    # each individual leg must still pay at least the ¥5 floor
+    for l in tight["fees"]["per_level"]:
+        assert l["fee_one_side"] >= 5.0
+    assert not any("below 2%" in w for w in wide["warnings"])
+
+
+def test_grid_app_form_waiving_minimum_lowers_the_fee_share():
+    from etfa.simulate import grid_app_form
+
+    a = grid_app_form(base_price=1.0, spacing_pct=3.0, qty_per_level=2800, min_commission=5.0)
+    b = grid_app_form(base_price=1.0, spacing_pct=3.0, qty_per_level=2800, min_commission=0.0)
+    assert b["fees"]["est_round_trip_bp"] < a["fees"]["est_round_trip_bp"]
+    assert b["fees"]["fee_share_of_spacing_pct"] < a["fees"]["fee_share_of_spacing_pct"]

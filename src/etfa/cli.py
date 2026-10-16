@@ -391,6 +391,19 @@ def cmd_watch(app: App, args) -> None:
        placed=placed_total, ticks=ticks, state=strat.dump_state())
 
 
+def cmd_grid_appform(app: App, args) -> None:
+    """Print the grid in the shape a broker App's grid form wants."""
+    from .simulate import grid_app_form
+
+    out = grid_app_form(
+        base_price=args.base, spacing_pct=args.spacing,
+        levels_up=args.levels_up, levels_down=args.levels_down,
+        qty_per_level=args.qty, commission_rate=args.commission_rate,
+        min_commission=0.0 if args.no_min_commission else args.min_commission,
+    )
+    ok(**out)
+
+
 def cmd_grid_ladder(app: App, args) -> None:
     strat = build_strategy("grid", code=args.code, base_price=args.base,
                            spacing_pct=args.spacing, levels_up=args.levels_up,
@@ -711,12 +724,25 @@ def build_parser() -> argparse.ArgumentParser:
     gsub = sp.add_subparsers(dest="grid_command", required=True)
     gl = gsub.add_parser("ladder", help="print the price ladder for a grid")
     gl.add_argument("--code", default="513050")
-    gl.add_argument("--base", type=float, default=1.092)
+    gl.add_argument("--base", type=float, default=1.011)
     gl.add_argument("--spacing", type=float, default=3.0)
     gl.add_argument("--levels-up", type=int, default=4, dest="levels_up")
     gl.add_argument("--levels-down", type=int, default=4, dest="levels_down")
     gl.add_argument("--qty", type=int, default=2800)
     gl.set_defaults(func=cmd_grid_ladder)
+
+    ga = gsub.add_parser("appform",
+                         help="print the grid as a broker App form would ask for it "
+                              "(range + grid count), with fee warnings")
+    ga.add_argument("--base", type=float, default=1.011, help="current/anchor price")
+    ga.add_argument("--spacing", type=float, default=3.0)
+    ga.add_argument("--levels-up", type=int, default=4, dest="levels_up")
+    ga.add_argument("--levels-down", type=int, default=4, dest="levels_down")
+    ga.add_argument("--qty", type=int, default=2800, help="shares per grid")
+    ga.add_argument("--commission-rate", type=float, default=0.00015, dest="commission_rate")
+    ga.add_argument("--min-commission", type=float, default=5.0, dest="min_commission")
+    ga.add_argument("--no-min-commission", action="store_true", dest="no_min_commission")
+    ga.set_defaults(func=cmd_grid_appform)
 
     sp = sub.add_parser("audit", help="recent audit events")
     sp.add_argument("--tail", type=int, default=20)

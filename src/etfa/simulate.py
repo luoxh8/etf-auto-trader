@@ -366,6 +366,102 @@ class _GuardConfig:
         return Path(name)
 
 
+def grid_app_form(
+    base_price: float = 1.011,
+    spacing_pct: float = 3.0,
+    levels_up: int = 4,
+    levels_down: int = 4,
+    qty_per_level: int = 2800,
+    commission_rate: float = 0.00015,
+    min_commission: float = 5.0,
+    tick: float = 0.001,
+) -> Dict[str, object]:
+    """Express a grid the way a broker App's grid form asks for it.
+
+    A broker grid form (国元点金 and most others) typically wants a **price range
+    plus a number of grids** and lays the grids out itself. This project's
+    strategy uses **geometric** (equal percentage) spacing, whereas such forms
+    almost always compute **arithmetic** (equal price) steps. Over a narrow range
+    the two nearly coincide; over a wide range they diverge, and the user should
+    know which one the App will actually place.
+
+    Returns both ladders, the deviation, and the per-level fee analysis against
+    the ¥5 minimum — everything needed to fill the form and sanity-check it.
+    """
+    up = [round(base_price * (1 + spacing_pct / 100) ** k, 3) for k in range(1, levels_up + 1)]
+    down = [round(base_price * (1 - spacing_pct / 100) ** k, 3) for k in range(1, levels_down + 1)]
+    upper = up[-1] if up else base_price
+    lower = down[-1] if down else base_price
+    grids = levels_up + levels_down
+
+    step = (upper - lower) / grids if grids else 0.0
+    arithmetic = [round(lower + step * i, 3) for i in range(grids + 1)]
+    geometric = list(reversed(down)) + [round(base_price, 3)] + up
+    deviation = max(abs(a - g) for a, g in zip(arithmetic, geometric)) if geometric else 0.0
+
+    cost = CostModel(commission_rate=commission_rate, min_commission=min_commission)
+
+    def leg(px: float) -> Dict[str, object]:
+        amount = round(qty_per_level * px, 2)
+        fee = cost.fee(amount)
+        return {
+            "price": px,
+            "amount": amount,
+            "fee_one_side": fee,
+            "fee_bp": round(fee / amount * 10000, 1) if amount else 0.0,
+        }
+
+    legs = [leg(p) for p in (lower, base_price, upper)]
+    round_trip_bp = round(sum(l["fee_bp"] for l in legs) / len(legs) * 2, 1)
+    gross_bp = spacing_pct * 100
+
+    return {
+        "base_price": base_price,
+        "spacing_pct": spacing_pct,
+        "app_form": {
+            "upper_bound": upper,
+            "lower_bound": lower,
+            "grid_count": grids,
+            "qty_per_grid": qty_per_level,
+            "anchor_hint": f"put the anchor/center near the current price ({base_price})",
+        },
+        "ladders": {
+            "geometric_this_project": geometric,
+            "arithmetic_app_likely": arithmetic,
+            "max_deviation": round(deviation, 3),
+            "deviation_ticks": round(deviation / tick, 1) if tick else 0,
+        },
+        "fees": {
+            "per_level": legs,
+            "est_round_trip_bp": round_trip_bp,
+            "grid_spacing_bp": gross_bp,
+            "fee_share_of_spacing_pct": round(round_trip_bp / gross_bp * 100, 1) if gross_bp else 0.0,
+        },
+        "warnings": _app_form_warnings(spacing_pct, round_trip_bp, deviation, tick),
+    }
+
+
+def _app_form_warnings(spacing_pct: float, fee_bp: float, deviation: float, tick: float) -> List[str]:
+    w = []
+    if spacing_pct < 2.0:
+        w.append(
+            f"spacing {spacing_pct}% is below 2% — the simulator shows this loses money "
+            "once the ¥5 minimum commission is paid (fees exceed the gross edge)."
+        )
+    if fee_bp >= spacing_pct * 100 * 0.5:
+        w.append(
+            f"round-trip fees (~{fee_bp}bp) eat ~{fee_bp / (spacing_pct * 100) * 100:.0f}% "
+            "of the grid spacing. Negotiate the ¥5 minimum away before tightening the grid."
+        )
+    if tick and deviation > tick:
+        w.append(
+            f"the App's arithmetic grid and this project's geometric grid differ by up to "
+            f"{deviation:.3f} ({deviation / tick:.0f} ticks). Do not run BOTH on the same "
+            "account — they would place overlapping orders."
+        )
+    return w
+
+
 def compare_cost_regimes(
     commission_rate: float = 0.00015,
     min_commission: float = 5.0,
