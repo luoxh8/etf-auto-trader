@@ -31,9 +31,13 @@ class FakeMainWindow:
 
 
 class FakeConfig:
+    """Mirrors the REAL easytrader `ths` config (verified by introspection),
+    including CANCEL_ENTRUST_ENTRUST_FIELD = '合同编号'."""
+
     TITLE = "网上股票交易系统5.0"
     BALANCE_CONTROL_ID_GROUP = {"资金余额": 1012, "可用金额": 1016,
-                                "股票市值": 1014, "总资产": 1015}
+                                "可取金额": 1017, "股票市值": 1014, "总资产": 1015}
+    CANCEL_ENTRUST_ENTRUST_FIELD = "合同编号"
 
 
 class FakeEasytraderClient:
@@ -51,9 +55,9 @@ class FakeEasytraderClient:
     @property
     def balance(self):
         return {"资金余额": f"{self.cash:.2f}", "可用金额": f"{self.cash:.2f}",
-                "最新市值": f"{self.held * self.price:.2f}",
-                "总资产": f"{self.cash + self.held * self.price:.2f}",
-                "冻结金额": "0"}
+                "可取金额": f"{self.cash:.2f}",
+                "股票市值": f"{self.held * self.price:.2f}",
+                "总资产": f"{self.cash + self.held * self.price:.2f}"}
 
     @property
     def position(self):
@@ -65,7 +69,10 @@ class FakeEasytraderClient:
 
     @property
     def today_entrusts(self):
-        return [{"委托编号": f"E{i:04d}", "证券代码": c, "操作": "买入" if s == "buy" else "卖出",
+        # real ths rows carry BOTH 委托编号 and 合同编号; easytrader cancels by
+        # the latter, so the fake must too (see FakeConfig)
+        return [{"委托编号": f"E{i:04d}", "合同编号": f"C{i:04d}", "证券代码": c,
+                 "操作": "买入" if s == "buy" else "卖出",
                  "委托价格": f"{p:.3f}", "委托数量": str(q), "成交数量": str(q),
                  "委托状态": "已报"}
                 for i, (s, c, p, q) in enumerate(self.placed, start=1)]
@@ -189,11 +196,16 @@ def test_live_orders_and_cancel(capsys, tmp_path, armed):
     code, out = run_cli("--config", str(cfg), "orders", capsys=capsys)
     assert out["ok"] is True
     assert out["count"] == 1
-    assert out["orders"][0]["side"] == "buy"
+    o = out["orders"][0]
+    assert o["side"] == "buy"
+    # the id must be the column easytrader cancels by (合同编号), not 委托编号
+    assert o["id"] == "C0001"
+    assert o["meta"]["entrust_no"] == "E0001"
+    assert o["meta"]["cancel_field"] == "合同编号"
 
-    code, out = run_cli("--config", str(cfg), "cancel", "E0001", capsys=capsys)
+    code, out = run_cli("--config", str(cfg), "cancel", "C0001", capsys=capsys)
     assert out["ok"] is True
-    assert out["cancelled"] == ["E0001"]
+    assert out["cancelled"] == ["C0001"]
 
 
 def test_live_risk_guard_still_applies(capsys, tmp_path, armed):

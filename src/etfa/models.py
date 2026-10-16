@@ -66,10 +66,14 @@ class Position:
 @dataclass
 class Balance:
     cash: float = 0.0         # total cash
-    available: float = 0.0    # withdrawable / usable today
+    available: float = 0.0    # usable for trading today
+    withdrawable: float = 0.0  # cash that can actually be withdrawn (T+1 settled)
     market_value: float = 0.0
     total: float = 0.0
     frozen: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass

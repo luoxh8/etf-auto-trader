@@ -424,11 +424,13 @@ def cmd_probe(app: App, args) -> None:
         rows = section.get("row_count", 0)
         # An EMPTY result is not a mismatch: with no rows there are no column
         # names to compare, so we cannot judge. Only a non-empty result whose
-        # columns do not map is a real incompatibility.
+        # REQUIRED columns do not map is a real incompatibility (optional columns
+        # are legitimately absent in some client configs).
         verdict[key] = {
             "readable": "error" not in section,
             "rows": rows,
             "fields_missing": mapping.get("missing", []) if rows else [],
+            "fields_missing_optional": mapping.get("missing_optional", []) if rows else [],
             "indeterminate": rows == 0 and "error" not in section,
         }
     # one overall answer: readable everywhere, no mapped-field gaps, title fine

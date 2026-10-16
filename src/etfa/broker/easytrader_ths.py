@@ -72,46 +72,71 @@ def _to_int(v: Any) -> int:
 
 
 # Logical fields and the Chinese/English column names that may carry them.
-# A field counts as "found" when ANY of its aliases is present, so a client that
+# A field counts as "found" when ANY of its alias is present, so a client that
 # writes 可用金额 where another writes 可用余额 is not reported as a mismatch.
-# `probe` uses these to diagnose a live client.
+#
+# Each entry is (field, aliases, required):
+#   required=True  -> the code genuinely needs it; absence is an incompatibility
+#   required=False -> nice-to-have; several configs (e.g. generic ths has no
+#                     冻结金额) legitimately omit it, so absence is NOT a fault.
+# `probe` uses these to diagnose a live client without crying wolf.
 BALANCE_FIELDS = (
-    ("cash", ("资金余额", "可用金额", "资金可用", "enable_balance")),
-    ("available", ("可用金额", "可用余额", "可用", "enable_balance")),
-    ("market_value", ("最新市值", "总市值", "股票市值", "market_value")),
-    ("total", ("总资产", "资产总值", "asset_balance")),
-    ("frozen", ("冻结金额", "冻结资金", "frozen_balance")),
+    ("cash", ("资金余额", "可用金额", "资金可用", "enable_balance"), True),
+    ("available", ("可用金额", "可用余额", "可用", "enable_balance"), True),
+    ("withdrawable", ("可取金额", "可取资金", "可提现金额"), False),
+    ("market_value", ("最新市值", "总市值", "股票市值", "market_value"), False),
+    ("total", ("总资产", "资产总值", "asset_balance"), True),
+    ("frozen", ("冻结金额", "冻结资金", "frozen_balance"), False),
 )
 POSITION_FIELDS = (
-    ("code", ("证券代码", "股票代码", "code")),
-    ("name", ("证券名称", "股票名称", "name")),
-    ("qty", ("股票余额", "证券数量", "当前持仓", "stock_balance")),
-    ("available", ("可用余额", "可用数量", "可卖数量", "enable_balance")),
-    ("cost", ("参考成本价", "成本价", "cost_price")),
-    ("last", ("市价", "最新价", "参考市价", "last")),
+    ("code", ("证券代码", "股票代码", "code"), True),
+    ("name", ("证券名称", "股票名称", "name"), False),
+    ("qty", ("股票余额", "证券数量", "当前持仓", "stock_balance"), True),
+    ("available", ("可用余额", "可用数量", "可卖数量", "enable_balance"), True),
+    ("cost", ("参考成本价", "成本价", "cost_price"), False),
+    ("last", ("市价", "最新价", "参考市价", "last"), False),
 )
 ENTRUST_FIELDS = (
-    ("id", ("委托编号", "entrust_no")),
-    ("code", ("证券代码", "股票代码", "code")),
-    ("side", ("操作", "买卖标志")),
-    ("price", ("委托价格", "委托均价", "entrust_price")),
-    ("qty", ("委托数量", "entrust_bs_count")),
-    ("filled", ("成交数量", "business_count")),
-    ("status", ("委托状态", "备注", "status")),
+    # NOTE ON ORDER IDENTITY: easytrader's cancel_entrust() looks the order up by
+    # the column named in its config's CANCEL_ENTRUST_ENTRUST_FIELD, which is
+    # '合同编号' (contract no.) for generic ths — NOT '委托编号' (entrust no.).
+    # The adapter reads that field name at runtime; these aliases make sure the
+    # value can be found either way.
+    ("cancel_id", ("合同编号", "cancel_entrust_id"), False),
+    ("id", ("委托编号", "entrust_no"), True),
+    ("code", ("证券代码", "股票代码", "code"), True),
+    ("side", ("操作", "买卖标志"), True),
+    ("price", ("委托价格", "委托均价", "entrust_price"), True),
+    ("qty", ("委托数量", "entrust_bs_count"), True),
+    ("filled", ("成交数量", "business_count"), False),
+    ("status", ("委托状态", "备注", "status"), True),
 )
 
 
 def _match_fields(columns: list, fields) -> Dict[str, Any]:
-    """For each logical field, report whether any alias matched and which one."""
+    """For each logical field, report whether any alias matched and which one.
+
+    ``missing_required`` is the list a caller should act on: optional fields that
+    a given client config legitimately omits are reported separately in
+    ``missing_optional`` so they never look like an incompatibility.
+    """
     lowered = {c.lower(): c for c in columns}
-    found, missing = {}, []
-    for field, aliases in fields:
+    found, missing_req, missing_opt = {}, [], []
+    for spec in fields:
+        field, aliases, required = spec
         hit = next((lowered[a.lower()] for a in aliases if a.lower() in lowered), None)
         if hit:
             found[field] = hit
+        elif required:
+            missing_req.append(field)
         else:
-            missing.append(field)
-    return {"found": found, "missing": missing, "aliases": {f: list(a) for f, a in fields}}
+            missing_opt.append(field)
+    return {
+        "found": found,
+        "missing": missing_req,               # keep the old key = required misses
+        "missing_optional": missing_opt,
+        "aliases": {f: list(a) for f, a, _ in fields},
+    }
 
 
 def detect_client_window_title(exe_path: str, _enumerator=None) -> Optional[str]:
@@ -317,10 +342,12 @@ class EasytraderThsBroker(BrokerAdapter):
         raw = raw or {}
         cash = _to_float(_pick(raw, "资金余额", "可用金额", "可用余额", "资金可用", "enable_balance"))
         available = _to_float(_pick(raw, "可用金额", "可用余额", "可用", "enable_balance", default=cash))
+        withdrawable = _to_float(_pick(raw, "可取金额", "可取资金", "可提现金额", default=available))
         mv = _to_float(_pick(raw, "最新市值", "总市值", "股票市值", "market_value"))
         total = _to_float(_pick(raw, "总资产", "资产总值", "asset_balance", default=0.0)) or (cash + mv)
         frozen = _to_float(_pick(raw, "冻结金额", "冻结资金", "frozen_balance"))
-        return Balance(cash=cash, available=available, market_value=mv, total=total, frozen=frozen)
+        return Balance(cash=cash, available=available, withdrawable=withdrawable,
+                       market_value=mv, total=total, frozen=frozen)
 
     def positions(self) -> List[Position]:
         raw = self._attr("position")
@@ -360,17 +387,34 @@ class EasytraderThsBroker(BrokerAdapter):
                 out[c] = Quote(code=c, name=p.name, last=p.last, prev_close=p.last, ts=now_iso())
         return out
 
+    def _cancel_field(self) -> str:
+        """The column easytrader will match on when cancelling.
+
+        easytrader's cancel_entrust() compares against the column named in its
+        config's CANCEL_ENTRUST_ENTRUST_FIELD ('合同编号' for generic ths — the
+        CONTRACT number, not the 委托编号). We must expose that same value as an
+        order id or cancelling can never match.
+        """
+        try:
+            return getattr(self._user.config, "CANCEL_ENTRUST_ENTRUST_FIELD", "") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     def orders(self, open_only: bool = False) -> List[Order]:
         raw = self._attr("today_entrusts")
+        cancel_field = self._cancel_field()
         out: List[Order] = []
         for row in raw or []:
             if not isinstance(row, dict):
                 continue
+            # prefer the exact column easytrader cancels by
+            cancel_id = str(_pick(row, cancel_field) or "") if cancel_field else ""
+            entrust_id = str(_pick(row, "委托编号", "entrust_no", default="") or "")
             qty = _to_int(_pick(row, "委托数量", "entrust_bs_count"))
             filled = _to_int(_pick(row, "成交数量", "business_count"))
             status_raw = str(_pick(row, "委托状态", "备注", "status", default=""))
             o = Order(
-                id=str(_pick(row, "委托编号", "entrust_no", default="")),
+                id=cancel_id or entrust_id,
                 code=str(_pick(row, "证券代码", "股票代码", "code", default="")),
                 side=SIDE_BUY if str(_pick(row, "操作", "买卖标志", default="")).startswith("买") else SIDE_SELL,
                 price=_to_float(_pick(row, "委托价格", "委托均价", "entrust_price")),
@@ -378,6 +422,11 @@ class EasytraderThsBroker(BrokerAdapter):
                 filled=filled,
                 status=_map_status(status_raw),
                 ts=now_iso(),
+                meta={
+                    "entrust_no": entrust_id,          # informational
+                    "cancel_field": cancel_field,      # shows which column was used
+                    "cancel_id": cancel_id or entrust_id,
+                },
             )
             if open_only and not o.is_open:
                 continue
