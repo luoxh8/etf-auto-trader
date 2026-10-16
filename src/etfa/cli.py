@@ -374,6 +374,33 @@ def cmd_grid_ladder(app: App, args) -> None:
     ok(ladder=strat.ladder(), state=strat.dump_state())
 
 
+def _automation_stack() -> Dict[str, Any]:
+    """Check the layers easytrader needs to drive a desktop client.
+
+    pywinauto -> comtypes -> pywin32, plus the clipboard helper easytrader uses
+    to read table data. All of this is independent of the brokerage client, so it
+    can be verified on any machine, with or without a client installed.
+    """
+    problems = []
+    for mod, label in (("win32api", "pywin32"), ("comtypes", "comtypes"),
+                       ("pywinauto", "pywinauto")):
+        try:
+            __import__(mod)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{label}: {type(exc).__name__}")
+    visible = None
+    if not problems:
+        try:
+            from pywinauto import Application, Desktop, findwindows, timings  # noqa: F401
+            import pywinauto.clipboard  # noqa: F401
+            visible = len([w for w in Desktop(backend="win32").windows() if w.is_visible()])
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"enumerate windows: {type(exc).__name__}: {exc}")
+    if problems:
+        return {"ok": False, "detail": "; ".join(problems)}
+    return {"ok": True, "detail": f"pywin32/comtypes/pywinauto ok; {visible} visible windows"}
+
+
 def cmd_probe(app: App, args) -> None:
     """Read-only diagnostic for the live client: what can we actually see?
 
@@ -388,15 +415,28 @@ def cmd_probe(app: App, args) -> None:
              f"broker '{app.adapter.name}' has no probe; it is a live-client diagnostic")
     raw = probe()
     # a compact verdict an AI can branch on
-    verdict = {}
+    verdict: Dict[str, Any] = {}
+    win = raw.get("window") or {}
+    verdict["window_title_ok"] = win.get("title_match")
     for key in ("balance", "position", "today_entrusts"):
         section = raw.get(key) or {}
         mapping = section.get("mapping") or {}
+        rows = section.get("row_count", 0)
+        # An EMPTY result is not a mismatch: with no rows there are no column
+        # names to compare, so we cannot judge. Only a non-empty result whose
+        # columns do not map is a real incompatibility.
         verdict[key] = {
             "readable": "error" not in section,
-            "rows": section.get("row_count", 0),
-            "fields_missing": mapping.get("missing", []),
+            "rows": rows,
+            "fields_missing": mapping.get("missing", []) if rows else [],
+            "indeterminate": rows == 0 and "error" not in section,
         }
+    # one overall answer: readable everywhere, no mapped-field gaps, title fine
+    readings_ok = all(
+        verdict[k]["readable"] and not verdict[k]["fields_missing"]
+        for k in ("balance", "position", "today_entrusts")
+    )
+    verdict["compatible"] = readings_ok and verdict.get("window_title_ok") in (True, None)
     ok(broker=app.adapter.name, verdict=verdict, raw=raw)
 
 
@@ -431,6 +471,10 @@ def cmd_doctor(app: App, args) -> None:
         except ImportError:
             check("easytrader_installed", False,
                   "install the [live] extra with: pip install -e \".[live]\" -i https://pypi.org/simple")
+        # Can this machine drive desktop windows at all? This is independent of
+        # the brokerage client, so it can be (and is) verified without one.
+        stack = _automation_stack()
+        check("automation_stack", stack["ok"], stack["detail"], blocking=True)
         check("exe_path", bool(app.cfg.broker.exe_path),
               app.cfg.broker.exe_path or "broker.exe_path is empty (required for clienttype='ths')")
 
@@ -564,6 +608,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # pywinauto emits a UserWarning on import ("Revert to STA COM threading
+    # mode") that would otherwise clutter stderr on every live command. The
+    # behaviour is correct for us, so silence just that message and keep stdout
+    # as the single JSON channel.
+    import warnings
+
+    warnings.filterwarnings("ignore", message=".*STA COM threading mode.*")
+    warnings.filterwarnings("ignore", category=UserWarning, module="pywinauto")
+
     parser = build_parser()
     args = parser.parse_args(argv)
     app = App(args)

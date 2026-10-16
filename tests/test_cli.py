@@ -63,6 +63,27 @@ def test_doctor_reports_checks(capsys, tmp_path):
     assert "can_trade_now" in out
 
 
+def test_doctor_checks_the_automation_stack_for_a_live_broker(capsys, tmp_path):
+    """The live path needs pywin32/comtypes/pywinauto. That is independent of
+    any client, so doctor must verify it and report it as blocking."""
+    cfg = {
+        "broker": {"type": "easytrader_ths", "clienttype": "ths", "exe_path": "C:\\x\\xiadan.exe"},
+        "trading": {"allowed_codes": ["513050"]},
+        "paths": {"var": str(tmp_path / "var")},
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+
+    code, out = run_cli("--config", str(p), "doctor", capsys=capsys)
+    assert out["ok"] is True
+    names = {c["check"]: c for c in out["checks"]}
+    assert "automation_stack" in names
+    # on this machine the stack is verified working; if it ever breaks, doctor
+    # must say so rather than letting a live run fail obscurely
+    assert names["automation_stack"]["blocking"] is True
+    assert names["automation_stack"]["detail"]
+
+
 def test_mock_buy_and_positions_roundtrip(capsys, tmp_path, monkeypatch):
     cfg = write_config(tmp_path)
     monkeypatch.setenv("ETFA_TEST", "1")

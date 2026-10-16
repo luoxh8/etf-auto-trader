@@ -20,14 +20,32 @@ import pytest
 from etfa.cli import main
 
 
+class FakeMainWindow:
+    """Stand-in for easytrader's `main` window wrapper."""
+
+    def __init__(self, title="网上股票交易系统5.0"):
+        self._title = title
+
+    def window_text(self):
+        return self._title
+
+
+class FakeConfig:
+    TITLE = "网上股票交易系统5.0"
+    BALANCE_CONTROL_ID_GROUP = {"资金余额": 1012, "可用金额": 1016,
+                                "股票市值": 1014, "总资产": 1015}
+
+
 class FakeEasytraderClient:
     """Mimics easytrader 0.23.7 ClientTrader as observed by introspection."""
 
-    def __init__(self, cash=50000.0, price=1.092, held=18000):
+    def __init__(self, cash=50000.0, price=1.092, held=18000, window_title=None):
         self.cash = cash
         self.price = price
         self.held = held
         self.placed = []
+        self.config = FakeConfig()
+        self.main = FakeMainWindow(window_title or FakeConfig.TITLE)
 
     # --- properties (NOT methods) ---
     @property
@@ -200,10 +218,33 @@ def test_probe_reports_columns_and_never_writes(capsys, tmp_path, armed):
     # every logical field is covered by one of its aliases on a well-behaved client
     assert v["balance"]["fields_missing"] == []
     assert v["position"]["fields_missing"] == []
-    raw = out["raw"]["position"]
-    assert "证券代码" in raw["columns_returned"]
-    assert raw["mapping"]["found"]["code"] == "证券代码"
+    raw = out["raw"]
+    assert "证券代码" in raw["position"]["columns_returned"]
+    assert raw["position"]["mapping"]["found"]["code"] == "证券代码"
+    # window identity: the fake matches easytrader's pinned expectation
+    assert raw["window"]["title_match"] is True
+    assert raw["window"]["expected_title"] == "网上股票交易系统5.0"
+    assert raw["menu_paths_used"]
+    assert v.get("compatible") is True
     assert armed.placed == []            # probe reads, never trades
+
+
+def test_probe_flags_a_window_title_mismatch(capsys, tmp_path, monkeypatch):
+    """A branded client with a different window title must be visible in probe."""
+    import etfa.cli as climod
+    from etfa.broker.easytrader_ths import EasytraderThsBroker
+
+    client = FakeEasytraderClient(window_title="国元远航")
+    monkeypatch.setattr(climod, "get_adapter",
+                        lambda c: EasytraderThsBroker(c, trader=client))
+
+    cfg = live_config(tmp_path)
+    code, out = run_cli("--config", str(cfg), "probe", capsys=capsys)
+    assert out["ok"] is True
+    w = out["raw"]["window"]
+    assert w["actual_title"] == "国元远航"
+    assert w["title_match"] is False
+    assert out["verdict"]["window_title_ok"] is False
 
 
 def test_probe_flags_a_client_with_unexpected_columns(capsys, tmp_path, monkeypatch):

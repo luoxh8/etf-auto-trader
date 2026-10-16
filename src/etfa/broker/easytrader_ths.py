@@ -308,8 +308,54 @@ class EasytraderThsBroker(BrokerAdapter):
         the 国元 client's control tree and column names are what easytrader (and
         therefore this adapter) expects. It reads, it never writes, and it shows
         exactly which expected Chinese columns came back unmatched.
+
+        It also reports the *window identity* check, because easytrader's generic
+        `ths` config is pinned to a specific window title and control-id set:
+        if the branded client's title differs, that is the first thing to look at.
         """
         out: Dict[str, Any] = {"clienttype": self.cfg.broker.clienttype}
+
+        # --- window identity: the hard-coded expectations in easytrader's ths config
+        expected_title = None
+        balance_ids = None
+        try:
+            cfg_obj = self._user.config
+            expected_title = getattr(cfg_obj, "TITLE", None)
+            balance_ids = getattr(cfg_obj, "BALANCE_CONTROL_ID_GROUP", None)
+        except Exception:  # noqa: BLE001 - a missing config must not break the probe
+            pass
+
+        actual_title = None
+        try:
+            main = self._user.main
+            if main is not None:
+                actual_title = main.window_text()
+        except Exception:  # noqa: BLE001
+            pass
+
+        out["window"] = {
+            "expected_title": expected_title,
+            "actual_title": actual_title,
+            "title_match": (
+                (actual_title == expected_title)
+                if (expected_title is not None and actual_title is not None)
+                else None
+            ),
+            "expected_balance_control_ids": balance_ids,
+            "note": (
+                "easytrader's 'ths' config is pinned to this window title and control-id set. "
+                "If title_match is false the branded client differs and controls may not be found."
+            ),
+        }
+        # menu paths this adapter navigates, so a mismatch is easy to eyeball
+        out["menu_paths_used"] = [
+            ["查询[F4]", "资金股票"],
+            ["查询[F4]", "当日委托"],
+            ["买入[F1]"],
+            ["卖出[F2]"],
+            ["撤单[F3]"],
+        ]
+
         for name, fields in (
             ("balance", BALANCE_FIELDS),
             ("position", POSITION_FIELDS),
