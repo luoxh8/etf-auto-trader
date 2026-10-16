@@ -84,6 +84,41 @@ def test_doctor_checks_the_automation_stack_for_a_live_broker(capsys, tmp_path):
     assert names["automation_stack"]["detail"]
 
 
+def test_doctor_rejects_a_nonexistent_exe_path(capsys, tmp_path):
+    """A typo in exe_path is the likeliest first-run problem, so doctor must
+    not report OK just because the string is non-empty."""
+    cfg = {
+        "broker": {"type": "easytrader_ths", "clienttype": "ths",
+                   "exe_path": r"C:\nope\does-not-exist\xiadan.exe"},
+        "trading": {"allowed_codes": ["513050"]},
+        "paths": {"var": str(tmp_path / "var")},
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+
+    code, out = run_cli("--config", str(p), "doctor", capsys=capsys)
+    names = {c["check"]: c for c in out["checks"]}
+    assert names["exe_path"]["ok"] is False
+    assert "does not exist" in names["exe_path"]["detail"]
+    assert out["ready"] is False          # it is a blocking check
+
+
+def test_doctor_accepts_an_existing_exe_path(capsys, tmp_path):
+    fake_exe = tmp_path / "xiadan.exe"
+    fake_exe.write_bytes(b"not really an exe")
+    cfg = {
+        "broker": {"type": "easytrader_ths", "clienttype": "ths", "exe_path": str(fake_exe)},
+        "trading": {"allowed_codes": ["513050"]},
+        "paths": {"var": str(tmp_path / "var")},
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+
+    code, out = run_cli("--config", str(p), "doctor", capsys=capsys)
+    names = {c["check"]: c for c in out["checks"]}
+    assert names["exe_path"]["ok"] is True
+
+
 def test_mock_buy_and_positions_roundtrip(capsys, tmp_path, monkeypatch):
     cfg = write_config(tmp_path)
     monkeypatch.setenv("ETFA_TEST", "1")

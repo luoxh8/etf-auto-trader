@@ -559,8 +559,18 @@ def cmd_doctor(app: App, args) -> None:
         # the brokerage client, so it can be (and is) verified without one.
         stack = _automation_stack()
         check("automation_stack", stack["ok"], stack["detail"], blocking=True)
-        check("exe_path", bool(app.cfg.broker.exe_path),
-              app.cfg.broker.exe_path or "broker.exe_path is empty (required for clienttype='ths')")
+        # the exe path must actually exist — a typo here is the most likely
+        # first-run problem, so do not report OK just because the string is set
+        exe = app.cfg.broker.exe_path
+        from pathlib import Path as _Path
+
+        if not exe:
+            check("exe_path", False, "broker.exe_path is empty (required for clienttype='ths')")
+        elif not _Path(exe).exists():
+            check("exe_path", False,
+                  f"file does not exist: {exe} — run scripts\\find-client.ps1 to locate it")
+        else:
+            check("exe_path", True, exe)
 
     s = classify(holidays_file=app.cfg.trading.holidays_file or None)
     check("market_open", s.tradable, f"{s.label} (tradable={s.tradable})", blocking=False)
