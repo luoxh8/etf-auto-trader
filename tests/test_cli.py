@@ -162,11 +162,114 @@ def test_buy_outside_whitelist_is_rejected_json(capsys, tmp_path, monkeypatch):
     assert code == 2
 
 
-def test_plan_never_submits(capsys, tmp_path, monkeypatch):
-    cfg = write_config(tmp_path)
+def _run_with_config(capsys, tmp_path, cfg: dict, argv: list, monkeypatch=None, broker=None):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+    return run_cli(*(["--config", str(p)] + argv), capsys=capsys)
+
+
+def test_rejected_order_does_not_latch_strategy_state(capsys, tmp_path, monkeypatch):
+    """A refused order must not leave the grid believing it owns a lot.
+
+    Regression: plan() latches the level optimistically; if the guard then
+    refuses the order and the state is persisted anyway, the grid later tries to
+    SELL shares it never bought and wedges permanently. Verified against the
+    real CLI before the fix (buy_state was [1,0,0,0] with an empty account).
+    """
     import etfa.cli as climod
     from etfa.broker.mock import MockBroker
 
+    cfg = {
+        "broker": {"type": "mock"},
+        "trading": {"allowed_codes": ["513050"], "max_order_amount": 1000.0,
+                    "max_daily_amount": 0.0, "min_order_amount": 0.0,
+                    "max_position_pct": 100.0},
+        "paths": {"var": str(tmp_path / "var")},
+    }
+    # price below the first buy level so the grid wants to buy
+    shared = MockBroker({"cash": 50000.0, "prices": {"513050": 0.96}, "positions": []})
+    shared.connect()
+    monkeypatch.setattr(climod, "get_adapter", lambda c: shared)
+
+    code, out = _run_with_config(
+        capsys, tmp_path, cfg,
+        ["--broker", "mock", "run", "grid", "--code", "513050",
+         "--base", "1.0", "--spacing", "3", "--qty", "2800"],
+        monkeypatch,
+    )
+    assert out["rejected"] == 1
+    assert out["placed"] == 0
+    assert out["rolled_back"] is True
+    # the latch must be back to idle
+    assert out["state"]["buy_state"] == [0, 0, 0, 0]
+    # and it must be what was persisted, not just what we reported
+    sf = tmp_path / "var" / "grid-513050.json"
+    saved = json.loads(sf.read_text(encoding="utf-8"))
+    assert saved["buy_state"] == [0, 0, 0, 0]
+
+
+def test_accepted_order_does_latch_strategy_state(capsys, tmp_path, monkeypatch):
+    """The complement: a filled order must commit the latch, so the grid will
+    later take profit on it. Without this the rollback would be a stop-the-world."""
+    import etfa.cli as climod
+    from etfa.broker.mock import MockBroker
+
+    cfg = {
+        "broker": {"type": "mock"},
+        "trading": {"allowed_codes": ["513050"], "max_order_amount": 0.0,
+                    "max_daily_amount": 0.0, "min_order_amount": 0.0,
+                    "max_position_pct": 100.0},
+        "paths": {"var": str(tmp_path / "var")},
+    }
+    shared = MockBroker({"cash": 50000.0, "prices": {"513050": 0.96}, "positions": []})
+    shared.connect()
+    monkeypatch.setattr(climod, "get_adapter", lambda c: shared)
+
+    code, out = _run_with_config(
+        capsys, tmp_path, cfg,
+        ["--broker", "mock", "run", "grid", "--code", "513050",
+         "--base", "1.0", "--spacing", "3", "--qty", "2800", "--force"],
+        monkeypatch,
+    )
+    assert out["placed"] == 1
+    assert out["rolled_back"] is False
+    assert out["state"]["buy_state"] == [1, 0, 0, 0]   # level latched LONG
+    assert shared.position_map()["513050"].qty == 2800
+
+
+def test_plan_still_discards_state(capsys, tmp_path, monkeypatch):
+    """`plan` must not persist anything — its latches are hypothetical."""
+    import etfa.cli as climod
+    from etfa.broker.mock import MockBroker
+
+    cfg = {
+        "broker": {"type": "mock"},
+        "trading": {"allowed_codes": ["513050"], "max_order_amount": 0.0,
+                    "min_order_amount": 0.0, "max_daily_amount": 0.0,
+                    "max_position_pct": 100.0},
+        "paths": {"var": str(tmp_path / "var")},
+    }
+    shared = MockBroker({"cash": 50000.0, "prices": {"513050": 0.96}, "positions": []})
+    shared.connect()
+    monkeypatch.setattr(climod, "get_adapter", lambda c: shared)
+
+    code, out = _run_with_config(
+        capsys, tmp_path, cfg,
+        ["--broker", "mock", "plan", "grid", "--code", "513050",
+         "--base", "1.0", "--spacing", "3", "--qty", "2800"],
+        monkeypatch,
+    )
+    assert out["intents"], "plan should describe the intent"
+    assert shared.calls == []      # nothing reached the broker
+    assert not (tmp_path / "var" / "grid-513050.json").exists()
+
+
+def test_plan_dry_run_reports_decision_without_persisting(capsys, tmp_path, monkeypatch):
+    """plan describes the intent and never touches the broker or the state file."""
+    import etfa.cli as climod
+    from etfa.broker.mock import MockBroker
+
+    cfg = write_config(tmp_path)
     shared = MockBroker({"cash": 100000, "prices": {"513050": 0.965}})
     shared.connect()
     monkeypatch.setattr(climod, "get_adapter", lambda cfg: shared)

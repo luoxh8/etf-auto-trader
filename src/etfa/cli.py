@@ -85,6 +85,38 @@ class App:
     def note(self, kind: str, **kw: Any) -> None:
         self.audit.append(AuditEvent(ts=now_iso(), kind=kind, **kw))
 
+    def strategy_tick(self, strat, ctx, force: bool, submit: bool, sf: str) -> Dict[str, Any]:
+        """Plan one tick, submit, and keep the strategy's state honest.
+
+        Why the snapshot dance: strategies mutate their own bookkeeping inside
+        ``plan()`` (a grid latches a level as LONG, a T strategy sets open_leg)
+        on the *assumption* the order will go through. The risk guard can still
+        refuse it. If that optimistic state were persisted, the grid would
+        believe it owns a lot it never bought and would later try to SELL shares
+        it does not have — and stay wedged there permanently.
+
+        So: snapshot, plan, submit, and roll the snapshot back for any intent
+        that was not accepted. State therefore only ever reflects reality.
+        """
+        before = strat.dump_state()
+        reqs = strat.plan(ctx)
+        results: List[Dict[str, Any]] = []
+        rolled_back = False
+        for req in reqs:
+            res = self.guard_and_submit(req, force=force, submit=submit)
+            results.append(res)
+            accepted = bool(res.get("ok")) and (bool(res.get("submitted")) or not submit)
+            if not accepted and not rolled_back:
+                strat.load_state(before)
+                rolled_back = True
+        _save_state(strat, sf)
+        return {
+            "results": results,
+            "placed": sum(1 for x in results if x.get("submitted")),
+            "rejected": sum(1 for x in results if not x.get("ok")),
+            "rolled_back": rolled_back,
+        }
+
     def context(self, codes: List[str], price_override: Optional[float] = None) -> StrategyContext:
         quotes = {}
         try:
@@ -328,15 +360,11 @@ def cmd_run(app: App, args) -> None:
     sf = _state_file(app, strat.name, args.code)
     _load_state(strat, sf)
     ctx = app.context([args.code], price_override=args.price)
-    reqs = strat.plan(ctx)
-    results = []
-    for r in reqs:
-        results.append(app.guard_and_submit(r, force=args.force, submit=True))
-    _save_state(strat, sf)
+    tick = app.strategy_tick(strat, ctx, force=args.force, submit=True, sf=sf)
     ok(strategy=strat.name, code=args.code, session=ctx.session_label,
-       placed=sum(1 for x in results if x.get("submitted")),
-       rejected=sum(1 for x in results if not x.get("ok")),
-       results=results, state=strat.dump_state())
+       placed=tick["placed"], rejected=tick["rejected"],
+       rolled_back=tick["rolled_back"],
+       results=tick["results"], state=strat.dump_state())
 
 
 def cmd_watch(app: App, args) -> None:
@@ -350,17 +378,13 @@ def cmd_watch(app: App, args) -> None:
     ticks = []
     for i in range(iterations):
         ctx = app.context([args.code], price_override=args.price)
-        reqs = strat.plan(ctx)
-        row = {"tick": i + 1, "ts": now_iso(), "session": ctx.session_label,
-               "price": (ctx.quote(args.code).last if ctx.quote(args.code) else None),
-               "intents": len(reqs), "results": []}
-        for r in reqs:
-            res = app.guard_and_submit(r, force=args.force, submit=not args.dry_run)
-            row["results"].append(res)
-            if res.get("submitted"):
-                placed_total += 1
-        ticks.append(row)
-        _save_state(strat, sf)
+        tick = app.strategy_tick(strat, ctx, force=args.force,
+                                 submit=not args.dry_run, sf=sf)
+        placed_total += tick["placed"]
+        ticks.append({"tick": i + 1, "ts": now_iso(), "session": ctx.session_label,
+                      "price": (ctx.quote(args.code).last if ctx.quote(args.code) else None),
+                      "intents": len(tick["results"]), "results": tick["results"],
+                      "rolled_back": tick["rolled_back"]})
         if i + 1 < iterations:
             time.sleep(args.interval)
     ok(strategy=strat.name, code=args.code, iterations=iterations,
