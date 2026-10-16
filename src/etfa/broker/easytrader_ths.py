@@ -149,6 +149,12 @@ def detect_client_window_title(exe_path: str, _enumerator=None) -> Optional[str]
     client with a different title would have its main window closed at connect
     time. Detecting the real title first and pinning it prevents that.
 
+    Implementation note: this uses only pywin32 (``win32gui`` +
+    ``win32process``), which the ``[live]`` extra already requires via pywinauto.
+    An earlier version used ``psutil``, which is **not** a dependency — the
+    import failed and the function silently returned None, so the protection
+    never actually engaged. Verified against a real process (notepad) this time.
+
     Read-only: enumerates windows, never clicks or types. ``_enumerator`` is a
     test seam.
     """
@@ -157,37 +163,36 @@ def detect_client_window_title(exe_path: str, _enumerator=None) -> Optional[str]
     try:
         import win32gui
         import win32process
-        import psutil
     except Exception:  # noqa: BLE001 - missing pieces = cannot detect, not fatal
         return None
 
     base = os.path.basename(exe_path).lower()
-    pids = set()
-    for proc in psutil.process_iter(["pid", "name"]):
-        try:
-            if (proc.info.get("name") or "").lower() == base:
-                pids.add(proc.info["pid"])
-        except Exception:  # noqa: BLE001
-            continue
-    if not pids:
+    if not base:
         return None
 
+    # Which PIDs own this executable? Enumerate top-level windows and match on
+    # the window's own process image name, avoiding a psutil dependency.
     found: List[tuple] = []
 
     def _cb(hwnd, _):
         try:
             if not win32gui.IsWindowVisible(hwnd):
                 return
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            if pid not in pids:
-                return
             title = win32gui.GetWindowText(hwnd) or ""
-            if title:
-                found.append((win32gui.GetClassName(hwnd), title))
-        except Exception:  # noqa: BLE001
+            if not title:
+                return
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if _process_image_name(pid) != base:
+                return
+            found.append((win32gui.GetClassName(hwnd), title))
+        except Exception:  # noqa: BLE001 - skip windows we cannot inspect
             return
 
-    win32gui.EnumWindows(_cb, None)
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:  # noqa: BLE001
+        return None
+
     if not found:
         return None
     # the classic dialog class is what easytrader's control ids live under
@@ -195,6 +200,30 @@ def detect_client_window_title(exe_path: str, _enumerator=None) -> Optional[str]
         if cls == "#32770":
             return title
     return found[0][1]
+
+
+def _process_image_name(pid: int) -> str:
+    """Lower-cased executable name for a PID, without psutil.
+
+    Uses QueryFullProcessImageName via win32api if available; falls back to the
+    window's process handle path. Returns "" when the name cannot be read
+    (which simply means we do not match that window).
+    """
+    try:
+        import win32api
+        import win32con
+        import win32process
+
+        handle = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ, False, pid
+        )
+        try:
+            path = win32process.GetModuleFileNameEx(handle, 0)
+        finally:
+            win32api.CloseHandle(handle)
+        return os.path.basename(path).lower()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 class EasytraderThsBroker(BrokerAdapter):

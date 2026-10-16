@@ -10,6 +10,7 @@ No client and no network are needed: `easytrader.use()` only builds an object.
 """
 from __future__ import annotations
 
+import builtins
 import inspect
 
 import pytest
@@ -127,6 +128,73 @@ def test_entrust_fields_cover_the_grid_dtype_columns():
     res = _match_fields(grid_cols, ENTRUST_FIELDS)
     # the code column must always be identifiable
     assert "code" in res["found"], f"none of GRID_DTYPE matched our code aliases: {grid_cols}"
+
+
+def test_no_module_in_the_live_path_imports_an_undeclared_dependency():
+    """The window-title guard silently returned None for its whole life because
+    it imported psutil, which the project never declared. Any module-level or
+    lazy import in the live path must resolve in a bare environment.
+
+    This walks the AST of every module in the package and flags imports that are
+    neither stdlib, nor the package itself, nor declared in pyproject.
+    """
+    import ast
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    src = repo / "src" / "etfa"
+
+    declared = {"easytrader", "pywin32", "pytest", "setuptools"}
+    # map distribution name -> import name where they differ
+    import_aliases = {"pywin32": "win32api", "win32api": "win32api"}
+    local_ok = {"win32api", "win32gui", "win32process", "win32con", "comtypes",
+                "pywinauto", "easytrader", "etfa"}
+
+    stdlib = set(sys.stdlib_module_names)
+    problems = []
+    for py in src.rglob("*.py"):
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:          # relative import, always fine
+                    continue
+                names = [(node.module or "").split(".")[0]]
+            else:
+                continue
+            for name in names:
+                if not name:
+                    continue
+                if name in stdlib or name in local_ok or name.startswith("etfa"):
+                    continue
+                problems.append(f"{py.relative_to(repo)}: {name}")
+
+    assert not problems, (
+        "these imports are not stdlib, local, or a declared dependency — they "
+        f"would fail at runtime in a clean install: {problems}"
+    )
+
+
+def test_window_detection_uses_only_pywin32(monkeypatch):
+    """Guard the specific regression: detection must not need psutil."""
+    import importlib
+    import sys as _sys
+
+    import etfa.broker.easytrader_ths as mod
+
+    # make `import psutil` fail if anything tries it
+    real_import = builtins.__import__
+
+    def deny_psutil(name, *args, **kwargs):
+        if name == "psutil":
+            raise ModuleNotFoundError("psutil is not installed (simulated)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", deny_psutil)
+    # must not raise; may legitimately return None on a machine with no such process
+    mod.detect_client_window_title(r"C:\no\such\program.exe")
 
 
 def test_every_logical_field_has_at_least_one_plausible_alias():

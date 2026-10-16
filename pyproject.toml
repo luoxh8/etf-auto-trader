@@ -20,6 +20,10 @@ dependencies = []
 # Live trading against a real brokerage client. `easytrader` drives the
 # already-logged-in 同花顺 desktop client; pywin32 is a runtime need of
 # pywinauto that its metadata forgets to declare (verified 2026-10-16).
+# NOTE: psutil is deliberately NOT a dependency — an earlier version of the
+# window-title guard imported it and silently disabled itself because it was
+# missing. The guard now uses pywin32 only, and a test forbids undeclared
+# imports anywhere in the package.
 live = ["easytrader>=0.23.7", "pywin32>=306"]
 test = ["pytest>=8.0"]
 
