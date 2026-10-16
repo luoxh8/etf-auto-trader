@@ -25,6 +25,7 @@ mysterious failure mid-order.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 from ..config import Config, broker_password
@@ -113,6 +114,64 @@ def _match_fields(columns: list, fields) -> Dict[str, Any]:
     return {"found": found, "missing": missing, "aliases": {f: list(a) for f, a in fields}}
 
 
+def detect_client_window_title(exe_path: str, _enumerator=None) -> Optional[str]:
+    """Read the main window title of the running client at ``exe_path``.
+
+    Why this exists: easytrader's ``connect()`` calls ``_close_prompt_windows()``,
+    which **closes every visible window of class ``#32770`` whose title differs
+    from its configured ``TITLE``** (``'网上股票交易系统5.0'`` for generic
+    ``ths``). The 同花顺-family main window IS class ``#32770``, so a branded
+    client with a different title would have its main window closed at connect
+    time. Detecting the real title first and pinning it prevents that.
+
+    Read-only: enumerates windows, never clicks or types. ``_enumerator`` is a
+    test seam.
+    """
+    if _enumerator is not None:
+        return _enumerator(exe_path)
+    try:
+        import win32gui
+        import win32process
+        import psutil
+    except Exception:  # noqa: BLE001 - missing pieces = cannot detect, not fatal
+        return None
+
+    base = os.path.basename(exe_path).lower()
+    pids = set()
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if (proc.info.get("name") or "").lower() == base:
+                pids.add(proc.info["pid"])
+        except Exception:  # noqa: BLE001
+            continue
+    if not pids:
+        return None
+
+    found: List[tuple] = []
+
+    def _cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid not in pids:
+                return
+            title = win32gui.GetWindowText(hwnd) or ""
+            if title:
+                found.append((win32gui.GetClassName(hwnd), title))
+        except Exception:  # noqa: BLE001
+            return
+
+    win32gui.EnumWindows(_cb, None)
+    if not found:
+        return None
+    # the classic dialog class is what easytrader's control ids live under
+    for cls, title in found:
+        if cls == "#32770":
+            return title
+    return found[0][1]
+
+
 class EasytraderThsBroker(BrokerAdapter):
     name = "easytrader_ths"
 
@@ -122,28 +181,47 @@ class EasytraderThsBroker(BrokerAdapter):
         # in production it is built lazily in connect().
         self._user: Any = trader
         self._connected = bool(trader)
+        self._title_source = "not connected"
+
+    def _pin_window_title(self, exe: str) -> None:
+        """Set the expected window title on the easytrader config, if we can.
+
+        Precedence: an explicit ``broker.expected_title`` wins; otherwise we
+        auto-detect from the running client. If both fail we leave easytrader's
+        default alone but record it, so ``probe`` can explain what happened.
+        """
+        self._title_source = "easytrader default"
+        title = self.cfg.broker.expected_title or detect_client_window_title(exe)
+        if not title:
+            return
+        self._title_source = (
+            "config" if self.cfg.broker.expected_title else "auto-detected"
+        )
+        try:
+            self._user.config.TITLE = title
+        except Exception:  # noqa: BLE001 - never block connecting over this
+            self._title_source = "failed to apply"
 
     # ---- connection -------------------------------------------------------
 
     def connect(self) -> None:
-        if self._user is not None:
-            self._connected = True
-            return
-        try:
-            import easytrader  # type: ignore
-        except ImportError as exc:  # pragma: no cover - exercised only when missing
-            raise BrokerError(
-                "easytrader is not installed. Install the live extra:\n"
-                "  pip install -e \".[live]\"  (from the repo, using its venv)\n"
-                "Note: if pip is pointed at a mirror that lacks easytrader, pass "
-                "-i https://pypi.org/simple"
-            ) from exc
-
         clienttype = self.cfg.broker.clienttype
-        try:
-            self._user = easytrader.use(clienttype)
-        except Exception as exc:  # noqa: BLE001 - easytrader raises bare exceptions
-            raise BrokerError(f"easytrader.use({clienttype!r}) failed: {exc}") from exc
+
+        # Build the easytrader object only if one was not injected.
+        if self._user is None:
+            try:
+                import easytrader  # type: ignore
+            except ImportError as exc:  # pragma: no cover - exercised only when missing
+                raise BrokerError(
+                    "easytrader is not installed. Install the live extra:\n"
+                    "  pip install -e \".[live]\"  (from the repo, using its venv)\n"
+                    "Note: if pip is pointed at a mirror that lacks easytrader, pass "
+                    "-i https://pypi.org/simple"
+                ) from exc
+            try:
+                self._user = easytrader.use(clienttype)
+            except Exception as exc:  # noqa: BLE001 - easytrader raises bare exceptions
+                raise BrokerError(f"easytrader.use({clienttype!r}) failed: {exc}") from exc
 
         if clienttype == "ths":
             exe = self.cfg.broker.exe_path
@@ -152,25 +230,32 @@ class EasytraderThsBroker(BrokerAdapter):
                     "broker.exe_path must point at the 同花顺/国元远航 client executable "
                     "(xiadan.exe / hexin.exe) when clienttype='ths'"
                 )
-            try:
-                self._user.connect(exe)
-            except Exception as exc:  # noqa: BLE001
-                raise NotConnected(
-                    f"could not attach to the client at {exe}: {exc}. "
-                    "Make sure the client is OPEN and LOGGED IN, then retry."
-                ) from exc
+            # Pin the expected window title BEFORE attaching. easytrader's
+            # connect() closes every #32770 window whose title differs from this
+            # value, and the main trading window is #32770 — so a branded client
+            # (国元远航) with a different title would have its main window closed.
+            self._pin_window_title(exe)
+            if not self._connected:
+                try:
+                    self._user.connect(exe)
+                except Exception as exc:  # noqa: BLE001
+                    raise NotConnected(
+                        f"could not attach to the client at {exe}: {exc}. "
+                        "Make sure the client is OPEN and LOGGED IN, then retry."
+                    ) from exc
         else:  # universal_client drives login from the credentials
-            user = self.cfg.broker.user
-            password = broker_password(self.cfg)
-            if not user or not password:
-                raise BrokerError(
-                    "clienttype='universal_client' needs broker.user and the password in "
-                    f"the ${self.cfg.broker.password_env} environment variable"
-                )
-            try:
-                self._user.prepare(user=user, password=password, exe_path=self.cfg.broker.exe_path)
-            except Exception as exc:  # noqa: BLE001
-                raise NotConnected(f"universal_client login failed: {exc}") from exc
+            if not self._connected:
+                user = self.cfg.broker.user
+                password = broker_password(self.cfg)
+                if not user or not password:
+                    raise BrokerError(
+                        "clienttype='universal_client' needs broker.user and the password in "
+                        f"the ${self.cfg.broker.password_env} environment variable"
+                    )
+                try:
+                    self._user.prepare(user=user, password=password, exe_path=self.cfg.broker.exe_path)
+                except Exception as exc:  # noqa: BLE001
+                    raise NotConnected(f"universal_client login failed: {exc}") from exc
 
         self._require_capability("balance")
         self._connected = True
@@ -341,10 +426,13 @@ class EasytraderThsBroker(BrokerAdapter):
                 if (expected_title is not None and actual_title is not None)
                 else None
             ),
+            "title_source": self._title_source,
             "expected_balance_control_ids": balance_ids,
             "note": (
                 "easytrader's 'ths' config is pinned to this window title and control-id set. "
-                "If title_match is false the branded client differs and controls may not be found."
+                "This adapter pins the title BEFORE connecting, because easytrader's connect() "
+                "closes every #32770 window whose title differs — and the main trading window "
+                "is #32770. title_source says where the pinned value came from."
             ),
         }
         # menu paths this adapter navigates, so a mismatch is easy to eyeball

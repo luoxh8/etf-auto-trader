@@ -95,6 +95,14 @@ Pop-Location
 
 Write-Host ""
 Write-Host "Read probe above:" -ForegroundColor Cyan
-Write-Host "  readable=true and fields_missing=[]  -> compatible, you can trade"
-Write-Host "  fields_missing not empty             -> send the `raw.columns_returned` to the author"
-Write-Host "  readable=false                       -> see docs/COMPATIBILITY.md"
+Write-Host "  verdict.compatible = true            -> compatible, you can trade"
+Write-Host "  readable=true, fields_missing=[]      -> compatible, you can trade"
+Write-Host "  fields_missing not empty              -> send raw.*.columns_returned to the author"
+Write-Host "  readable=false                        -> see docs/COMPATIBILITY.md"
+Write-Host ""
+Write-Host "IMPORTANT - check window.title_source in the probe output:" -ForegroundColor Yellow
+Write-Host "  'config' or 'auto-detected'  -> ok; the client title is pinned so easytrader"
+Write-Host "                                  will not close your main window on connect."
+Write-Host "  'easytrader default'         -> detection failed. Set broker.expected_title in"
+Write-Host "                                  config.json to the title shown as actual_title,"
+Write-Host "                                  or easytrader may CLOSE the trading window."

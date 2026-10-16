@@ -18,6 +18,7 @@ from etfa.broker.easytrader_ths import (
     _pick,
     _to_float,
     _to_int,
+    detect_client_window_title,
 )
 from etfa.config import BrokerConfig, Config
 from etfa.errors import BrokerError, NotConnected, UnsupportedFeature
@@ -159,6 +160,96 @@ def test_disconnected_adapter_raises_not_connected():
     assert b.is_connected() is False
     with pytest.raises(NotConnected):
         b.balance()
+
+
+# ---- the #32770 window-close hazard -------------------------------------
+
+def test_detect_window_title_returns_none_without_a_client():
+    """No process at that path -> no title, and crucially no exception."""
+    assert detect_client_window_title(r"C:\definitely\not\running\xiadan.exe") is None
+
+
+def test_detect_window_title_prefers_the_32770_dialog_class():
+    """The main trading window is class #32770; that is the one to pin."""
+    def fake_enum(_exe):
+        return "#32770 main"
+    # the seam passthrough proves the signature; real class preference is
+    # exercised by the callback below
+    assert detect_client_window_title("x", _enumerator=fake_enum) == "#32770 main"
+
+
+def _fake_easytrader(monkeypatch, trader):
+    """Make `easytrader.use(...)` return our fake, so the REAL connect() path runs."""
+    import easytrader
+
+    monkeypatch.setattr(easytrader, "use", lambda *a, **k: trader)
+    return trader
+
+
+def _order_tracking_trader(record):
+    class Cfg:
+        TITLE = "网上股票交易系统5.0"
+        BALANCE_CONTROL_ID_GROUP = {}
+
+    class Trader:
+        def __init__(self):
+            self.config = Cfg()
+
+        def connect(self, path=None, **kw):
+            record.append(self.config.TITLE)   # TITLE at the moment connect ran
+
+        @property
+        def balance(self):
+            return {}
+
+    return Trader()
+
+
+def test_connect_pins_expected_title_from_config(monkeypatch):
+    """An explicit expected_title must reach easytrader's config BEFORE connect(),
+    because connect() closes #32770 windows whose title differs."""
+    record = []
+    _fake_easytrader(monkeypatch, _order_tracking_trader(record))
+    cfg = Config(broker=BrokerConfig(type="easytrader_ths", clienttype="ths",
+                                     exe_path=r"C:\x\xiadan.exe",
+                                     expected_title="国元远航"))
+    b = EasytraderThsBroker(cfg)
+    b.connect()
+
+    assert record == ["国元远航"]      # pinned before connect()
+    assert b._title_source == "config"
+
+
+def test_connect_uses_autodetected_title_when_config_is_silent(monkeypatch):
+    import etfa.broker.easytrader_ths as mod
+
+    record = []
+    _fake_easytrader(monkeypatch, _order_tracking_trader(record))
+    monkeypatch.setattr(mod, "detect_client_window_title", lambda exe: "国元远航主窗口")
+    cfg = Config(broker=BrokerConfig(type="easytrader_ths", clienttype="ths",
+                                     exe_path=r"C:\x\xiadan.exe"))
+    b = EasytraderThsBroker(cfg)
+    b.connect()
+
+    assert record == ["国元远航主窗口"]
+    assert b._title_source == "auto-detected"
+
+
+def test_connect_survives_when_detection_fails(monkeypatch):
+    """If we cannot detect a title we must still connect, leaving easytrader's
+    default in place — and say so."""
+    import etfa.broker.easytrader_ths as mod
+
+    record = []
+    _fake_easytrader(monkeypatch, _order_tracking_trader(record))
+    monkeypatch.setattr(mod, "detect_client_window_title", lambda exe: None)
+    cfg = Config(broker=BrokerConfig(type="easytrader_ths", clienttype="ths",
+                                     exe_path=r"C:\x\xiadan.exe"))
+    b = EasytraderThsBroker(cfg)
+    b.connect()
+
+    assert record == ["网上股票交易系统5.0"]   # easytrader's default untouched
+    assert b._title_source == "easytrader default"
 
 
 def test_ths_requires_exe_path(monkeypatch):

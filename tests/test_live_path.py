@@ -224,6 +224,7 @@ def test_probe_reports_columns_and_never_writes(capsys, tmp_path, armed):
     # window identity: the fake matches easytrader's pinned expectation
     assert raw["window"]["title_match"] is True
     assert raw["window"]["expected_title"] == "网上股票交易系统5.0"
+    assert "title_source" in raw["window"]
     assert raw["menu_paths_used"]
     assert v.get("compatible") is True
     assert armed.placed == []            # probe reads, never trades

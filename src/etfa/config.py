@@ -29,6 +29,14 @@ class BrokerConfig:
     user: str = ""                     # only for universal_client
     password_env: str = "ETFA_BROKER_PASSWORD"
     connect_timeout: float = 20.0
+    expected_title: str = ""           # override the client's main-window title.
+    #   WHY THIS MATTERS: easytrader's connect() calls _close_prompt_windows(),
+    #   which CLOSES every visible window of class #32770 whose title differs
+    #   from its configured TITLE ('网上股票交易系统5.0' for generic ths). The
+    #   同花顺-family main window IS class #32770, so a branded client with a
+    #   different title can have its main window closed at connect time. The
+    #   adapter auto-detects the real title before connecting; set this to pin it
+    #   explicitly if detection fails.
 
 
 @dataclass
@@ -81,6 +89,7 @@ class Config:
                 "exe_path": self.broker.exe_path,
                 "user": self.broker.user,
                 "password_env": self.broker.password_env,
+                "expected_title": self.broker.expected_title,
             },
             "trading": {
                 "allowed_codes": self.trading.allowed_codes,
@@ -109,6 +118,7 @@ def _from_dict(raw: Dict[str, Any], root: Path) -> Config:
         user=str(broker_raw.get("user", "")),
         password_env=str(broker_raw.get("password_env", "ETFA_BROKER_PASSWORD")),
         connect_timeout=float(broker_raw.get("connect_timeout", 20.0)),
+        expected_title=str(broker_raw.get("expected_title", "")),
     )
     trading = TradingConfig(
         allowed_codes=[str(c).strip() for c in (trading_raw.get("allowed_codes") or [])],

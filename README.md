@@ -338,6 +338,11 @@ etf-auto-trader\
 
 ## 已知风险（务必先读）
 
+0. **easytrader 的 `connect()` 会关闭标题不匹配的 `#32770` 窗口**，而客户端主窗口正是该类。
+   若国元远航的主窗口标题不等于 easytrader 预设的 `网上股票交易系统5.0`，
+   连接时可能**关掉你的交易窗口**。本项目已在 attach 前自动探测并固定标题
+   （`probe` 的 `title_source` 会说明来源）；若它显示 `easytrader default`，
+   请按 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) 手动设置 `broker.expected_title`。
 1. **GUI 自动化很脆** —— easytrader 靠控件树找按钮，同花顺/国元客户端一升级就可能失效。
    **锁定客户端版本、关掉自动更新。**
 2. **国元的控件兼容性未实测** —— 本机没装国元客户端，无法验证。见 docs/COMPATIBILITY.md。

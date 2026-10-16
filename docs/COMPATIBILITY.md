@@ -39,6 +39,42 @@ easytrader 为每个券商实现了控件定位类。国元远航虽是同花顺
 缺能力时抛 `UnsupportedFeature`，并明确告诉你缺哪个方法，
 而不是在订单中途莫名其妙失败。
 
+## ⚠ 一个必须先知道的隐患：easytrader 可能关掉你的客户端主窗口
+
+`easytrader` 的 `connect()` 会调用 `_close_prompt_windows()`，它的实现是
+（`clienttrader.py:399-407`）：
+
+```python
+for window in self._app.windows(class_name="#32770", visible_only=True):
+    title = window.window_text()
+    if title != self._config.TITLE:      # TITLE 默认 '网上股票交易系统5.0'
+        window.close()                    # ← 关掉
+```
+
+**关键点**：同花顺系客户端的**主交易窗口正是 `#32770` 类**。
+
+所以：如果国元远航的主窗口标题**不等于** easytrader 预设的
+`网上股票交易系统5.0`，`connect()` 就会**把你的交易主窗口直接关掉**。
+
+**本项目的处理**：适配器在 attach **之前**先探测真实窗口标题并写入
+`config.TITLE`，所以正常情况下不会发生。`probe` 的输出里有 `title_source` 说明这个值来自哪：
+
+| `title_source` | 含义 |
+|---|---|
+| `config` | 来自你在配置里写的 `broker.expected_title`（最稳） |
+| `auto-detected` | 适配器自动探测到的（正常） |
+| `easytrader default` | 探测也失败了，用的是 easytrader 默认值 —— **有风险** |
+| `failed to apply` | 写不进去（异常） |
+
+若 `title_source` 是 `easytrader default`，**请手动设置**：
+
+```json
+{ "broker": { "expected_title": "你看到的客户端窗口标题" } }
+```
+
+窗口标题怎么看：把鼠标移到客户端标题栏看文字，或 `probe` 输出的
+`actual_title` 就是它。
+
 ## easytrader 0.23.7 的真实接口（已用内省核实，2026-10-16）
 
 这些事实来自对本机已安装的 easytrader 做 `inspect`，不是猜测。
@@ -57,6 +93,12 @@ easytrader 为每个券商实现了控件定位类。国元远航虽是同花顺
 `easytrader.use()` 的取值：`ths` / `universal_client` / `gj_client` / `ht_client` /
 `htzq_client` / `yh_client` / `gf_client` / `wk_client` / `miniqmt` / `xq`。
 `ths` 返回的是通用 `ClientTrader`。
+
+**`ths` 是内置通用配置**（`client.create('ths')` 直接返回一个类），自带硬编码期望值：
+`TITLE = '网上股票交易系统5.0'`、
+`BALANCE_CONTROL_ID_GROUP = {资金余额:1012, 可用金额:1016, 可取金额:1017, 股票市值:1014, 总资产:1015}`、
+`TRADE_SECURITY_CONTROL_ID=1032` / `TRADE_PRICE_CONTROL_ID=1033` / `TRADE_AMOUNT_CONTROL_ID=1034`。
+**窗口标题和控件 ID 都是硬编码的** —— 这正是贴牌客户端最可能对不上的地方。
 
 ## 两个由客户端能力决定的功能限制
 
