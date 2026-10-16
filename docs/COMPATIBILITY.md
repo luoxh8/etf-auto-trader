@@ -66,6 +66,12 @@ for window in self._app.windows(class_name="#32770", visible_only=True):
 | `easytrader default` | 探测也失败了，用的是 easytrader 默认值 —— **有风险** |
 | `failed to apply` | 写不进去（异常） |
 
+> ⚠ **这个防护曾经是坏的（2026-10-16 修复）**：探测函数最初 `import psutil`，
+> 而 psutil **不是本项目依赖** → 导入失败、被宽 except 吞掉、**永远返回 None**。
+> 于是标题从未被固定，隐患完全生效。**它此前所有测试都发现不了**（要么注入假函数、
+> 要么断言返回 None）；**只有拿真实进程跑才暴露**（pywinauto 能读到标题、我们的函数读不到）。
+> 现已改为**只用 pywin32**，并加了「禁止未声明依赖」的 AST 测试防复发。
+
 若 `title_source` 是 `easytrader default`，**请手动设置**：
 
 ```json
