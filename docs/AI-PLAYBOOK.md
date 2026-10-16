@@ -31,13 +31,27 @@
 
 ```
 1. etfa doctor                  → ready=true 且 can_trade_now=true 才继续
-2. etfa positions               → 记下每个标的的 qty 和 available
-3. etfa quote <code>            → 拿到现价
-4. etfa plan <strategy> ...     → 看策略意图（绝不下单）
-5. 把 plan 结果给用户看，等确认
-6. etfa run <strategy> ...      → 执行
-7. etfa audit --tail 20         → 复核
+2. etfa probe                   → 首次接入必跑：readable=true 且 fields_missing=[] 才继续
+3. etfa positions               → 记下每个标的的 qty 和 available
+4. etfa quote <code>            → 拿到现价（可能没有：easytrader 无行情源）
+5. etfa plan <strategy> ...     → 看策略意图（绝不下单）
+6. 把 plan 结果给用户看，等确认
+7. etfa run <strategy> ...      → 执行
+8. etfa audit --tail 20         → 复核
 ```
+
+## 价格从哪来（重要）
+
+`easytrader` **不提供行情**。所以 `quote` 只能读到**你已持有**标的的市价。
+
+- 若 `quote` 返回 `missing`，说明该代码没有价格源；
+- 这时策略命令必须显式传 `--price`（例如从别的数据源拿到的价格）：
+
+```
+etfa plan grid --code 513050 --base 1.092 --spacing 3 --qty 2800 --price 1.095
+```
+
+**不要凭空编一个价格传进去** —— 先问用户或接一个行情源。
 
 ## 硬性禁止
 

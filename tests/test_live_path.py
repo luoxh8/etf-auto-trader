@@ -186,3 +186,54 @@ def test_live_risk_guard_still_applies(capsys, tmp_path, armed):
     assert out["ok"] is False
     assert out["error"] == "risk_rejected"
     assert armed.placed == []            # nothing reached the client
+
+
+def test_probe_reports_columns_and_never_writes(capsys, tmp_path, armed):
+    """The diagnostic must show what came back and touch nothing."""
+    cfg = live_config(tmp_path)
+    code, out = run_cli("--config", str(cfg), "probe", capsys=capsys)
+    assert out["ok"] is True, out
+    v = out["verdict"]
+    assert v["balance"]["readable"] is True
+    assert v["balance"]["rows"] == 1
+    assert v["position"]["rows"] == 1
+    # every logical field is covered by one of its aliases on a well-behaved client
+    assert v["balance"]["fields_missing"] == []
+    assert v["position"]["fields_missing"] == []
+    raw = out["raw"]["position"]
+    assert "证券代码" in raw["columns_returned"]
+    assert raw["mapping"]["found"]["code"] == "证券代码"
+    assert armed.placed == []            # probe reads, never trades
+
+
+def test_probe_flags_a_client_with_unexpected_columns(capsys, tmp_path, monkeypatch):
+    """A client whose columns differ must be diagnosable, not mysterious."""
+    import etfa.cli as climod
+    from etfa.broker.easytrader_ths import EasytraderThsBroker
+
+    class OddClient:
+        @property
+        def balance(self):
+            return {"CashAvail": "1.00"}          # English / unknown columns
+
+        @property
+        def position(self):
+            return [{"Symbol": "513050", "Vol": "100"}]
+
+        @property
+        def today_entrusts(self):
+            return []
+
+    cfg_path = live_config(tmp_path)
+
+    def factory(cfg):
+        b = EasytraderThsBroker(cfg, trader=OddClient())
+        b._connected = True
+        return b
+
+    monkeypatch.setattr(climod, "get_adapter", factory)
+
+    code, out = run_cli("--config", str(cfg_path), "probe", capsys=capsys)
+    assert out["ok"] is True, out
+    assert out["verdict"]["balance"]["fields_missing"] != []
+    assert "CashAvail" in out["raw"]["balance"]["columns_returned"]

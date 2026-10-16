@@ -70,6 +70,49 @@ def _to_int(v: Any) -> int:
     return int(_to_float(v))
 
 
+# Logical fields and the Chinese/English column names that may carry them.
+# A field counts as "found" when ANY of its aliases is present, so a client that
+# writes 可用金额 where another writes 可用余额 is not reported as a mismatch.
+# `probe` uses these to diagnose a live client.
+BALANCE_FIELDS = (
+    ("cash", ("资金余额", "可用金额", "资金可用", "enable_balance")),
+    ("available", ("可用金额", "可用余额", "可用", "enable_balance")),
+    ("market_value", ("最新市值", "总市值", "股票市值", "market_value")),
+    ("total", ("总资产", "资产总值", "asset_balance")),
+    ("frozen", ("冻结金额", "冻结资金", "frozen_balance")),
+)
+POSITION_FIELDS = (
+    ("code", ("证券代码", "股票代码", "code")),
+    ("name", ("证券名称", "股票名称", "name")),
+    ("qty", ("股票余额", "证券数量", "当前持仓", "stock_balance")),
+    ("available", ("可用余额", "可用数量", "可卖数量", "enable_balance")),
+    ("cost", ("参考成本价", "成本价", "cost_price")),
+    ("last", ("市价", "最新价", "参考市价", "last")),
+)
+ENTRUST_FIELDS = (
+    ("id", ("委托编号", "entrust_no")),
+    ("code", ("证券代码", "股票代码", "code")),
+    ("side", ("操作", "买卖标志")),
+    ("price", ("委托价格", "委托均价", "entrust_price")),
+    ("qty", ("委托数量", "entrust_bs_count")),
+    ("filled", ("成交数量", "business_count")),
+    ("status", ("委托状态", "备注", "status")),
+)
+
+
+def _match_fields(columns: list, fields) -> Dict[str, Any]:
+    """For each logical field, report whether any alias matched and which one."""
+    lowered = {c.lower(): c for c in columns}
+    found, missing = {}, []
+    for field, aliases in fields:
+        hit = next((lowered[a.lower()] for a in aliases if a.lower() in lowered), None)
+        if hit:
+            found[field] = hit
+        else:
+            missing.append(field)
+    return {"found": found, "missing": missing, "aliases": {f: list(a) for f, a in fields}}
+
+
 class EasytraderThsBroker(BrokerAdapter):
     name = "easytrader_ths"
 
@@ -254,6 +297,44 @@ class EasytraderThsBroker(BrokerAdapter):
             if open_only and not o.is_open:
                 continue
             out.append(o)
+        return out
+
+    # ---- diagnostics ------------------------------------------------------
+
+    def probe(self) -> Dict[str, Any]:
+        """Report the RAW client payloads and whether our column mapping matches.
+
+        This is the tool for the one thing that cannot be tested offline: whether
+        the 国元 client's control tree and column names are what easytrader (and
+        therefore this adapter) expects. It reads, it never writes, and it shows
+        exactly which expected Chinese columns came back unmatched.
+        """
+        out: Dict[str, Any] = {"clienttype": self.cfg.broker.clienttype}
+        for name, fields in (
+            ("balance", BALANCE_FIELDS),
+            ("position", POSITION_FIELDS),
+            ("today_entrusts", ENTRUST_FIELDS),
+        ):
+            try:
+                raw = self._attr(name)
+            except EtfaError as exc:
+                out[name] = {"error": exc.code, "message": str(exc)}
+                continue
+            if isinstance(raw, list):
+                row = raw[0] if raw else {}
+                count = len(raw)
+            elif isinstance(raw, dict):
+                row, count = raw, 1
+            else:
+                row, count = {}, 0
+            cols = sorted(str(k) for k in row.keys()) if isinstance(row, dict) else []
+            out[name] = {
+                "type": type(raw).__name__,
+                "row_count": count,
+                "columns_returned": cols,
+                "mapping": _match_fields(cols, fields),
+                "sample": row,
+            }
         return out
 
     # ---- writes -----------------------------------------------------------

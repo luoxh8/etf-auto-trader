@@ -168,12 +168,26 @@ Copy-Item config\config.example.json config\config.json
 ```powershell
 .\.venv\Scripts\python.exe -m etfa doctor
 .\.venv\Scripts\python.exe -m etfa status --connect
+.\.venv\Scripts\python.exe -m etfa probe        # ← 最关键：看能不能真读到数据
 .\.venv\Scripts\python.exe -m etfa balance
 .\.venv\Scripts\python.exe -m etfa positions
 ```
 
-如果 `easytrader` 报「client lacks ...」，说明国元的客户端界面布局与 easytrader
-预设的控件不匹配 —— 见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
+**如果不知从哪里下手，就跑 `probe`。** 它是只读诊断，会打印客户端返回的
+**原始字段名**以及本项目的字段映射是否匹配：
+
+```jsonc
+{"ok": true, "verdict": {
+  "balance":  {"readable": true, "rows": 1, "fields_missing": []},
+  "position": {"readable": true, "rows": 1, "fields_missing": []},
+  ...
+}, "raw": {"position": {"columns_returned": ["证券代码","证券名称",...], ...}}}
+```
+
+- `readable: true` 且 `fields_missing: []` → 客户端兼容，可以往下走。
+- `fields_missing` 非空 → 客户端的列名和本项目预期不同，把 `raw` 里的
+  `columns_returned` 发给作者/贴 issue 就能加映射。
+- `readable: false` → 见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
 ### 第 6 步：先小额实盘验证
 
@@ -224,6 +238,7 @@ CLI 的每个命令都**只输出一个 JSON 对象**，所以 AI 可以直接�
 | `status [--connect]` | 配置 + 交易时段 + 可选实时余额 |
 | `session` | 当前交易时段分类 |
 | `doctor` | 起飞前检查（不交易） |
+| `probe` | **实盘只读诊断**：打印客户端原始字段与映射是否匹配 |
 | `config` | 打印生效配置 |
 | `balance` / `positions` | 资金 / 持仓 |
 | `quote [codes...]` | 行情 |

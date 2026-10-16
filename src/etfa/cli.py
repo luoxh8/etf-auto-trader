@@ -374,6 +374,32 @@ def cmd_grid_ladder(app: App, args) -> None:
     ok(ladder=strat.ladder(), state=strat.dump_state())
 
 
+def cmd_probe(app: App, args) -> None:
+    """Read-only diagnostic for the live client: what can we actually see?
+
+    Run this the first time the client is connected. It shows the raw payloads
+    and which of the expected Chinese columns matched, which is where a
+    client-specific mismatch would show up.
+    """
+    app.connect()
+    probe = getattr(app.adapter, "probe", None)
+    if probe is None:
+        fail("unsupported_feature",
+             f"broker '{app.adapter.name}' has no probe; it is a live-client diagnostic")
+    raw = probe()
+    # a compact verdict an AI can branch on
+    verdict = {}
+    for key in ("balance", "position", "today_entrusts"):
+        section = raw.get(key) or {}
+        mapping = section.get("mapping") or {}
+        verdict[key] = {
+            "readable": "error" not in section,
+            "rows": section.get("row_count", 0),
+            "fields_missing": mapping.get("missing", []),
+        }
+    ok(broker=app.adapter.name, verdict=verdict, raw=raw)
+
+
 def cmd_audit(app: App, args) -> None:
     events = app.audit.tail(args.tail)
     ok(events=events, count=len(events), notional_today=app.audit.notional_today())
@@ -453,6 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("doctor", help="pre-flight checks, no trading")
     sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("probe", help="live-client diagnostic: what can we read? (read-only)")
+    sp.set_defaults(func=cmd_probe)
 
     sp = sub.add_parser("config", help="show effective config")
     sp.set_defaults(func=cmd_config_show)
