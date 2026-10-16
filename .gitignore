@@ -1,0 +1,11 @@
+# runtime state: audit journal, strategy state, mock seeds written at runtime
+var/
+*.pyc
+__pycache__/
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.idea/
+.vscode/

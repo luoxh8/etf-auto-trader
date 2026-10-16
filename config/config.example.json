@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy to config.json and edit. NO credentials belong here.",
+  "broker": {
+    "type": "easytrader_ths",
+    "clienttype": "ths",
+    "exe_path": "C:\\path\\to\\国元远航\\xiadan.exe",
+    "user": "",
+    "password_env": "ETFA_BROKER_PASSWORD",
+    "connect_timeout": 20.0
+  },
+  "trading": {
+    "allowed_codes": ["513050"],
+    "t0_codes": ["513050"],
+    "min_order_amount": 1000.0,
+    "max_order_amount": 10000.0,
+    "max_daily_amount": 30000.0,
+    "max_position_pct": 80.0,
+    "allow_outside_hours": false,
+    "holidays_file": ""
+  },
+  "paths": {
+    "var": "var"
+  }
+}

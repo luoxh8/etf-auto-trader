@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etf-auto-trader"
+version = "0.1.0"
+description = "CLI-driven ETF auto-trading for a personal A-share brokerage account (国元证券 via 同花顺 PC client)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "luoxh8" }]
+
+# Core has ZERO third-party dependencies: the CLI, strategy engine and risk
+# guard all run on the standard library, so `etfa --help` and mock-mode work
+# on a bare interpreter (and in CI) without installing a trading stack.
+dependencies = []
+
+[project.optional-dependencies]
+# Live trading against a real brokerage client. `easytrader` drives the
+# already-logged-in 同花顺 desktop client; pywin32 is a runtime need of
+# pywinauto that its metadata forgets to declare (verified 2026-10-16).
+live = ["easytrader>=0.23.7", "pywin32>=306"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+etfa = "etfa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

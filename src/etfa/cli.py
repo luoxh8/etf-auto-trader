@@ -1,0 +1,541 @@
+"""The `etfa` command surface.
+
+Design constraints, in order of importance:
+
+1. **Machine-first.** Every command prints exactly one JSON object to stdout
+   and nothing else, so an AI (or a shell pipeline) can parse it without
+   scraping human text. Errors are JSON too, with a stable ``error`` code.
+2. **Safe by default.** ``plan`` never orders. ``run`` and the primitive
+   ``buy``/``sell`` always pass through the risk guard. Nothing trades outside
+   trading hours unless ``--force`` is given.
+3. **No secrets on disk.** The live adapter attaches to a client the user has
+   already logged into; there is no password argument.
+
+Run ``etfa --help`` or ``etfa <command> --help`` for the full surface.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from typing import Any, Dict, List, Optional
+
+from . import __version__
+from .audit import AuditEvent, AuditLog
+from .broker import get_adapter
+from .config import Config, load_config
+from .errors import EtfaError, RiskRejected, TradingHoursError
+from .models import OrderRequest, SIDE_BUY, SIDE_SELL, now_iso
+from .risk import RiskGuard
+from .strategies import build as build_strategy
+from .strategies.base import StrategyContext
+from .timeutil import classify, next_open_after, session_note
+
+
+# --------------------------------------------------------------------------
+# output helpers
+# --------------------------------------------------------------------------
+
+def emit(obj: Dict[str, Any], exit_code: int = 0) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+    sys.stdout.flush()
+    raise SystemExit(exit_code)
+
+
+def ok(**fields: Any) -> None:
+    emit({"ok": True, **fields})
+
+
+def fail(code: str, message: str, exit_code: int = 2, **extra: Any) -> None:
+    emit({"ok": False, "error": code, "message": message, **extra}, exit_code=exit_code)
+
+
+# --------------------------------------------------------------------------
+# context construction
+# --------------------------------------------------------------------------
+
+class App:
+    """Holds the loaded config, audit log, adapter and guard for one command."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        try:
+            self.cfg: Config = load_config(getattr(args, "config", None))
+        except EtfaError as exc:
+            fail(exc.code, str(exc))
+        if getattr(args, "broker", None):
+            self.cfg.broker.type = args.broker
+        self.audit = AuditLog(self.cfg.audit_path())
+        self.guard = RiskGuard(self.cfg, self.audit)
+        self._adapter = None
+
+    @property
+    def adapter(self):
+        if self._adapter is None:
+            self._adapter = get_adapter(self.cfg)
+        return self._adapter
+
+    def connect(self) -> None:
+        a = self.adapter
+        if not a.is_connected():
+            a.connect()
+
+    def note(self, kind: str, **kw: Any) -> None:
+        self.audit.append(AuditEvent(ts=now_iso(), kind=kind, **kw))
+
+    def context(self, codes: List[str]) -> StrategyContext:
+        quotes = {}
+        try:
+            quotes = self.adapter.quote(codes)
+        except EtfaError:
+            quotes = {}
+        try:
+            positions = self.adapter.position_map()
+        except EtfaError:
+            positions = {}
+        try:
+            bal = self.adapter.balance()
+            cash = bal.available
+        except EtfaError:
+            cash = 0.0
+        return StrategyContext(
+            quotes=quotes,
+            positions=positions,
+            cash_available=cash,
+            session_label=classify(holidays_file=self.cfg.trading.holidays_file or None).label,
+        )
+
+    def guard_and_submit(self, req: OrderRequest, force: bool, submit: bool,
+                         enforce_hours: bool = True) -> Dict[str, Any]:
+        ctx = self.context([req.code])
+        q = ctx.quote(req.code)
+        try:
+            bal = self.adapter.balance()
+            total_assets = bal.total
+        except EtfaError:
+            total_assets = 0.0
+        try:
+            decision = self.guard.evaluate(
+                req, q, force=force, broker=self.adapter.name,
+                position_qty=ctx.held(req.code), sellable=ctx.sellable(req.code),
+                total_assets=total_assets, enforce_hours=enforce_hours,
+            )
+        except RiskRejected as exc:
+            self.guard.reject(req, exc, code_label="risk_rejected")
+            return {"ok": False, "error": exc.code, "message": str(exc), "intent": _req_dict(req)}
+        except TradingHoursError as exc:
+            self.guard.reject(req, exc, code_label="outside_trading_hours")
+            return {"ok": False, "error": exc.code, "message": str(exc), "intent": _req_dict(req)}
+
+        self.audit.append(AuditEvent(
+            ts=now_iso(), kind="intent", code=req.code, side=req.side,
+            qty=decision.qty, price=decision.price, amount=decision.amount,
+            detail=req.reason, broker=self.adapter.name,
+        ))
+
+        if not submit:
+            return {"ok": True, "submitted": False, "decision": decision.to_dict(),
+                    "intent": _req_dict(req)}
+
+        # submit
+        try:
+            if req.side == SIDE_BUY:
+                order = self.adapter.buy(req.code, decision.price, decision.qty)
+            else:
+                order = self.adapter.sell(req.code, decision.price, decision.qty)
+        except EtfaError as exc:
+            self.audit.append(AuditEvent(ts=now_iso(), kind="error", ok=False, code=req.code,
+                                         side=req.side, detail=str(exc), broker=self.adapter.name))
+            return {"ok": False, "error": exc.code, "message": str(exc), "decision": decision.to_dict()}
+
+        placed_ok = order.status != "rejected"
+        self.audit.append(AuditEvent(
+            ts=now_iso(), kind="placed", ok=placed_ok, code=req.code,
+            side=req.side, qty=decision.qty, price=decision.price, amount=decision.amount,
+            order_id=order.id, broker=self.adapter.name,
+            detail=order.message or req.reason,
+        ))
+        if not placed_ok:
+            # the broker refused it — report that, do not pretend it worked
+            return {"ok": False, "error": "broker_error", "submitted": False,
+                    "message": order.message or "broker rejected the order",
+                    "decision": decision.to_dict(), "order": order.to_dict()}
+        return {"ok": True, "submitted": True, "decision": decision.to_dict(), "order": order.to_dict()}
+
+
+def _req_dict(req: OrderRequest) -> Dict[str, Any]:
+    return {"code": req.code, "side": req.side, "qty": req.qty, "amount": req.amount,
+            "price": req.price, "reason": req.reason}
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_status(app: App, args) -> None:
+    s = classify(holidays_file=app.cfg.trading.holidays_file or None)
+    out: Dict[str, Any] = {
+        "version": __version__,
+        "config_root": str(app.cfg.root),
+        "broker_type": app.cfg.broker.type,
+        "session": s.to_dict(),
+        "session_note": session_note(app.cfg.trading.holidays_file or None),
+        "now": now_iso(),
+        "next_open": next_open_after().isoformat(timespec="minutes"),
+        "allowed_codes": app.cfg.trading.allowed_codes,
+        "t0_codes": app.cfg.trading.t0_codes,
+    }
+    connected = False
+    if args.connect:
+        try:
+            app.connect()
+            connected = True
+        except EtfaError as exc:
+            out["connect_error"] = {"error": exc.code, "message": str(exc)}
+    out["connected"] = connected
+    if connected:
+        try:
+            b = app.adapter.balance()
+            out["balance"] = {"cash": b.cash, "available": b.available,
+                              "market_value": b.market_value, "total": b.total}
+        except EtfaError as exc:
+            out["balance_error"] = {"error": exc.code, "message": str(exc)}
+    ok(**out)
+
+
+def cmd_session(app: App, args) -> None:
+    s = classify(holidays_file=app.cfg.trading.holidays_file or None)
+    ok(session=s.to_dict(), note=session_note(app.cfg.trading.holidays_file or None), now=now_iso())
+
+
+def cmd_balance(app: App, args) -> None:
+    app.connect()
+    b = app.adapter.balance()
+    ok(balance=b.__dict__)
+
+
+def cmd_positions(app: App, args) -> None:
+    app.connect()
+    ps = app.adapter.positions()
+    ok(positions=[p.__dict__ | {"market_value": p.market_value} for p in ps])
+
+
+def cmd_quote(app: App, args) -> None:
+    app.connect()
+    codes = args.codes or app.cfg.trading.allowed_codes
+    if not codes:
+        fail("config_error", "no codes given and trading.allowed_codes is empty")
+    q = app.adapter.quote(codes)
+    ok(quotes={k: v.to_dict() for k, v in q.items()},
+       missing=[c for c in codes if c not in q])
+
+
+def cmd_orders(app: App, args) -> None:
+    app.connect()
+    os_ = app.adapter.orders(open_only=args.open)
+    ok(orders=[o.to_dict() for o in os_], count=len(os_))
+
+
+def cmd_cancel(app: App, args) -> None:
+    app.connect()
+    ids = app.adapter.cancel(args.order_id)
+    for i in ids:
+        app.note("cancel", order_id=i, broker=app.adapter.name)
+    ok(cancelled=ids, count=len(ids))
+
+
+def _make_req(args) -> OrderRequest:
+    return OrderRequest(
+        code=args.code, side=args.side, qty=getattr(args, "qty", None),
+        amount=getattr(args, "amount", None), price=getattr(args, "price", 0.0) or 0.0,
+        reason=getattr(args, "reason", "") or "manual",
+    )
+
+
+def cmd_buy(app: App, args) -> None:
+    args.side = SIDE_BUY
+    app.connect()
+    # a dry run submits nothing, so it reports the decision even outside hours
+    res = app.guard_and_submit(_make_req(args), force=args.force,
+                               submit=not args.dry_run, enforce_hours=not args.dry_run)
+    emit(res, exit_code=0 if res.get("ok") else 2)
+
+
+def cmd_sell(app: App, args) -> None:
+    args.side = SIDE_SELL
+    app.connect()
+    res = app.guard_and_submit(_make_req(args), force=args.force,
+                               submit=not args.dry_run, enforce_hours=not args.dry_run)
+    emit(res, exit_code=0 if res.get("ok") else 2)
+
+
+def _strategy_from_args(args):
+    name = args.strategy
+    if name == "grid":
+        return build_strategy(
+            "grid",
+            code=args.code, base_price=args.base, spacing_pct=args.spacing,
+            levels_up=args.levels_up, levels_down=args.levels_down,
+            qty_per_level=args.qty, lower_bound=args.lower, upper_bound=args.upper,
+        )
+    if name == "t":
+        return build_strategy(
+            "t", code=args.code, qty=args.qty, trigger_pct=args.trigger,
+            take_profit_pct=args.take_profit, t0=args.t0,
+        )
+    fail("config_error", f"unknown strategy {name!r}")
+
+
+def _state_file(app: App, name: str, code: str) -> str:
+    return str(app.cfg.state_path(f"{name}-{code}.json"))
+
+
+def cmd_plan(app: App, args) -> None:
+    """Dry-run: show what the strategy wants to do, order nothing."""
+    app.connect()
+    strat = _strategy_from_args(args)
+    sf = _state_file(app, strat.name, args.code)
+    _load_state(strat, sf)
+    ctx = app.context([args.code])
+    reqs = strat.plan(ctx)
+    decisions = []
+    for r in reqs:
+        # planning is read-only: report the intent even outside trading hours,
+        # but still run every other guardrail so the plan is honest about limits
+        d = app.guard_and_submit(r, force=args.force, submit=False, enforce_hours=False)
+        decisions.append(d)
+    ok(strategy=strat.name, code=args.code, session=ctx.session_label,
+       quote=(ctx.quote(args.code).to_dict() if ctx.quote(args.code) else None),
+       intents=[_req_dict(r) for r in reqs],
+       decisions=decisions, state=strat.dump_state())
+
+
+def cmd_run(app: App, args) -> None:
+    """One strategy tick: plan, guard, submit for real."""
+    app.connect()
+    strat = _strategy_from_args(args)
+    sf = _state_file(app, strat.name, args.code)
+    _load_state(strat, sf)
+    ctx = app.context([args.code])
+    reqs = strat.plan(ctx)
+    results = []
+    for r in reqs:
+        results.append(app.guard_and_submit(r, force=args.force, submit=True))
+    _save_state(strat, sf)
+    ok(strategy=strat.name, code=args.code, session=ctx.session_label,
+       placed=sum(1 for x in results if x.get("submitted")),
+       rejected=sum(1 for x in results if not x.get("ok")),
+       results=results, state=strat.dump_state())
+
+
+def cmd_watch(app: App, args) -> None:
+    """Loop the strategy. Bounded by --iterations so an AI cannot leak a daemon."""
+    app.connect()
+    strat = _strategy_from_args(args)
+    sf = _state_file(app, strat.name, args.code)
+    _load_state(strat, sf)
+    iterations = args.iterations
+    placed_total = 0
+    ticks = []
+    for i in range(iterations):
+        ctx = app.context([args.code])
+        reqs = strat.plan(ctx)
+        row = {"tick": i + 1, "ts": now_iso(), "session": ctx.session_label,
+               "price": (ctx.quote(args.code).last if ctx.quote(args.code) else None),
+               "intents": len(reqs), "results": []}
+        for r in reqs:
+            res = app.guard_and_submit(r, force=args.force, submit=not args.dry_run)
+            row["results"].append(res)
+            if res.get("submitted"):
+                placed_total += 1
+        ticks.append(row)
+        _save_state(strat, sf)
+        if i + 1 < iterations:
+            time.sleep(args.interval)
+    ok(strategy=strat.name, code=args.code, iterations=iterations,
+       placed=placed_total, ticks=ticks, state=strat.dump_state())
+
+
+def cmd_grid_ladder(app: App, args) -> None:
+    strat = build_strategy("grid", code=args.code, base_price=args.base,
+                           spacing_pct=args.spacing, levels_up=args.levels_up,
+                           levels_down=args.levels_down, qty_per_level=args.qty)
+    ok(ladder=strat.ladder(), state=strat.dump_state())
+
+
+def cmd_audit(app: App, args) -> None:
+    events = app.audit.tail(args.tail)
+    ok(events=events, count=len(events), notional_today=app.audit.notional_today())
+
+
+def cmd_config_show(app: App, args) -> None:
+    ok(config=app.cfg.to_public_dict())
+
+
+def cmd_doctor(app: App, args) -> None:
+    """Pre-flight: what is ready and what is missing, without trading.
+
+    ``ready`` means "the tool is configured well enough to trade"; whether the
+    market is *open* right now is reported separately as ``market_open`` — being
+    closed for the day must not look like a broken install.
+    """
+    checks: List[Dict[str, Any]] = []
+
+    def check(name: str, okflag: bool, detail: str, blocking: bool = True) -> None:
+        checks.append({"check": name, "ok": bool(okflag), "detail": detail, "blocking": blocking})
+
+    check("config", True, str(app.cfg.root))
+    check("allowed_codes", bool(app.cfg.trading.allowed_codes),
+          f"{app.cfg.trading.allowed_codes}" if app.cfg.trading.allowed_codes else "empty (all codes blocked)")
+    if app.cfg.broker.type == "easytrader_ths":
+        try:
+            import easytrader  # noqa: F401
+            check("easytrader_installed", True, "import ok")
+        except ImportError:
+            check("easytrader_installed", False,
+                  "install the [live] extra with: pip install -e \".[live]\" -i https://pypi.org/simple")
+        check("exe_path", bool(app.cfg.broker.exe_path),
+              app.cfg.broker.exe_path or "broker.exe_path is empty (required for clienttype='ths')")
+
+    s = classify(holidays_file=app.cfg.trading.holidays_file or None)
+    check("market_open", s.tradable, f"{s.label} (tradable={s.tradable})", blocking=False)
+
+    blocking_ok = all(c["ok"] for c in checks if c["blocking"])
+    ok(checks=checks, ready=blocking_ok, market_open=s.tradable,
+       can_trade_now=(blocking_ok and s.tradable))
+
+
+def _load_state(strat, path: str) -> None:
+    from pathlib import Path
+    p = Path(path)
+    if p.exists():
+        try:
+            strat.load_state(json.loads(p.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+
+
+def _save_state(strat, path: str) -> None:
+    from pathlib import Path
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(strat.dump_state(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# argument parser
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="etfa", description="CLI-driven ETF auto-trading.")
+    p.add_argument("--config", help="path to config.json (default: ./config/config.json)")
+    p.add_argument("--broker", help="override broker.type: mock | easytrader_ths | qmt")
+    p.add_argument("--version", action="version", version=f"etfa {__version__}")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("status", help="config + session + optional live balance")
+    sp.add_argument("--connect", action="store_true", help="also try to connect to the broker")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("session", help="trading-session classification")
+    sp.set_defaults(func=cmd_session)
+
+    sp = sub.add_parser("doctor", help="pre-flight checks, no trading")
+    sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("config", help="show effective config")
+    sp.set_defaults(func=cmd_config_show)
+
+    sp = sub.add_parser("balance", help="account balance")
+    sp.set_defaults(func=cmd_balance)
+
+    sp = sub.add_parser("positions", help="current positions")
+    sp.set_defaults(func=cmd_positions)
+
+    sp = sub.add_parser("quote", help="quotes for codes")
+    sp.add_argument("codes", nargs="*", help="6-digit codes (default: allowed_codes)")
+    sp.set_defaults(func=cmd_quote)
+
+    sp = sub.add_parser("orders", help="today's orders")
+    sp.add_argument("--open", action="store_true", help="only open orders")
+    sp.set_defaults(func=cmd_orders)
+
+    sp = sub.add_parser("cancel", help="cancel one order, or all open orders")
+    sp.add_argument("order_id", nargs="?", help="order id; omit to cancel all open orders")
+    sp.set_defaults(func=cmd_cancel)
+
+    for cname, fn in (("buy", cmd_buy), ("sell", cmd_sell)):
+        sp = sub.add_parser(cname, help=f"{cname} ETF shares (subject to the risk guard)")
+        sp.add_argument("code")
+        g = sp.add_mutually_exclusive_group(required=True)
+        g.add_argument("--qty", type=int, help="shares (rounded down to 100-lot)")
+        g.add_argument("--amount", type=float, help="notional in CNY")
+        sp.add_argument("--price", type=float, default=0.0, help="limit price; default = bid1/ask1")
+        sp.add_argument("--reason", default="", help="free-text reason recorded in the audit log")
+        sp.add_argument("--force", action="store_true", help="bypass the trading-hours check")
+        sp.add_argument("--dry-run", action="store_true", help="run the guard, place nothing")
+        sp.set_defaults(func=fn)
+
+    for cname, fn, helptext in (
+        ("plan", cmd_plan, "dry-run a strategy tick (never orders)"),
+        ("run", cmd_run, "one strategy tick, submitting orders"),
+        ("watch", cmd_watch, "loop a strategy tick"),
+    ):
+        sp = sub.add_parser(cname, help=helptext)
+        sp.add_argument("strategy", choices=["grid", "t"])
+        sp.add_argument("--code", required=True)
+        sp.add_argument("--base", type=float, default=1.092, help="grid: anchor price")
+        sp.add_argument("--spacing", type=float, default=3.0, help="grid: %% between levels")
+        sp.add_argument("--levels-up", type=int, default=4, dest="levels_up")
+        sp.add_argument("--levels-down", type=int, default=4, dest="levels_down")
+        sp.add_argument("--qty", type=int, default=2800, help="shares per grid level / T leg")
+        sp.add_argument("--lower", type=float, default=0.0, help="grid: hard lower bound")
+        sp.add_argument("--upper", type=float, default=0.0, help="grid: hard upper bound")
+        sp.add_argument("--trigger", type=float, default=1.5, help="t: %% move from reference")
+        sp.add_argument("--take-profit", type=float, default=1.5, dest="take_profit", help="t: %% to close a leg")
+        sp.add_argument("--t0", action=argparse.BooleanOptionalAction, default=True,
+                        help="t: fund is T+0 (allows 正T); use --no-t0 for T+1 funds")
+        sp.add_argument("--force", action="store_true")
+        sp.add_argument("--dry-run", action="store_true")
+        if cname == "watch":
+            sp.add_argument("--interval", type=float, default=30.0, help="seconds between ticks")
+            sp.add_argument("--iterations", type=int, default=10, help="how many ticks (bounded)")
+        sp.set_defaults(func=fn)
+
+    sp = sub.add_parser("grid", help="grid helpers")
+    gsub = sp.add_subparsers(dest="grid_command", required=True)
+    gl = gsub.add_parser("ladder", help="print the price ladder for a grid")
+    gl.add_argument("--code", default="513050")
+    gl.add_argument("--base", type=float, default=1.092)
+    gl.add_argument("--spacing", type=float, default=3.0)
+    gl.add_argument("--levels-up", type=int, default=4, dest="levels_up")
+    gl.add_argument("--levels-down", type=int, default=4, dest="levels_down")
+    gl.add_argument("--qty", type=int, default=2800)
+    gl.set_defaults(func=cmd_grid_ladder)
+
+    sp = sub.add_parser("audit", help="recent audit events")
+    sp.add_argument("--tail", type=int, default=20)
+    sp.set_defaults(func=cmd_audit)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    app = App(args)
+    try:
+        args.func(app, args)
+    except EtfaError as exc:
+        fail(exc.code, str(exc))
+    except KeyboardInterrupt:
+        fail("interrupted", "interrupted by user", exit_code=130)
+    except Exception as exc:  # noqa: BLE001 - last-resort JSON error
+        fail("unexpected", f"{type(exc).__name__}: {exc}", exit_code=1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
