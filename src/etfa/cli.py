@@ -443,12 +443,17 @@ def cmd_probe(app: App, args) -> None:
 
 
 def cmd_simulate(app: App, args) -> None:
-    """Run the grid strategy over a synthetic price path, offline.
+    """Run a strategy over a synthetic price path, offline.
 
-    Answers "does this grid survive a session, net of the ¥5 minimum commission?"
+    Answers "does this survive a session, net of the ¥5 minimum commission?"
     without touching a broker. The strategy and risk guard are the shipped ones.
     """
-    from .simulate import CostModel, compare_cost_regimes, make_price_path, simulate_grid
+    from .simulate import (
+        CostModel,
+        compare_cost_regimes,
+        simulate_grid,
+        simulate_t,
+    )
 
     cost = CostModel(
         commission_rate=args.commission_rate,
@@ -457,54 +462,64 @@ def cmd_simulate(app: App, args) -> None:
     common = dict(
         code=args.code,
         base_price=args.base,
-        spacing_pct=args.spacing,
-        qty_per_level=args.qty,
-        levels_up=args.levels_up,
-        levels_down=args.levels_down,
         starting_cash=args.cash,
-        starting_position=args.position or int(args.cash * 0.4 / args.base // 100 * 100),
         ticks=args.ticks,
         seed=args.seed,
     )
 
+    if args.strategy == "grid":
+        runner = lambda sc: simulate_grid(  # noqa: E731
+            spacing_pct=args.spacing, qty_per_level=args.qty,
+            levels_up=args.levels_up, levels_down=args.levels_down,
+            starting_position=args.position or int(args.cash * 0.4 / args.base // 100 * 100),
+            scenario=sc, cost=cost, **common,
+        )
+    else:  # the intraday-T strategy
+        runner = lambda sc: simulate_t(  # noqa: E731
+            qty=args.qty, trigger_pct=args.trigger, take_profit_pct=args.take_profit,
+            t0=args.t0, scenario=sc, cost=cost, **common,
+        )
+
     if args.compare_fees:
-        # compare_cost_regimes builds its own two CostModels; it must not also
-        # receive ours (that collided on the `cost` keyword)
+        # compare_cost_regimes owns its two CostModels
+        if args.strategy != "grid":
+            fail("unsupported_feature", "--compare-fees currently supports --strategy grid only")
         out = compare_cost_regimes(
-            commission_rate=args.commission_rate,
-            min_commission=args.min_commission,
-            **common,
+            commission_rate=args.commission_rate, min_commission=args.min_commission,
+            code=args.code, base_price=args.base, spacing_pct=args.spacing,
+            qty_per_level=args.qty, levels_up=args.levels_up, levels_down=args.levels_down,
+            starting_cash=args.cash,
+            starting_position=args.position or int(args.cash * 0.4 / args.base // 100 * 100),
+            ticks=args.ticks, seed=args.seed,
         )
         ok(**out)
         return
 
     if args.scenario == "all":
-        results = {}
-        for sc in ("range", "up", "down"):
-            results[sc] = simulate_grid(scenario=sc, cost=cost, **common).to_dict()
-        ok(scenarios=results, costs=cost.describe(),
+        results = {sc: runner(sc).to_dict() for sc in ("range", "up", "down")}
+        ok(strategy=args.strategy, scenarios=results, costs=cost.describe(),
            verdict=_sim_verdict(results))
         return
 
-    res = simulate_grid(scenario=args.scenario, cost=cost, **common)
-    ok(**res.to_dict(), costs=cost.describe())
+    res = runner(args.scenario)
+    ok(strategy=args.strategy, **res.to_dict(), costs=cost.describe())
 
 
 def _sim_verdict(results: Dict[str, Any]) -> Dict[str, Any]:
     """A blunt read of the three-scenario sweep, so an AI need not interpret."""
     rng = results.get("range", {})
-    up = results.get("up", {})
-    down = results.get("down", {})
     return {
         "range_net_pnl": rng.get("net_pnl"),
-        "up_net_pnl": up.get("net_pnl"),
-        "down_net_pnl": down.get("net_pnl"),
+        "up_net_pnl": results.get("up", {}).get("net_pnl"),
+        "down_net_pnl": results.get("down", {}).get("net_pnl"),
         "profitable_in_range": (rng.get("net_pnl") or 0) > 0,
         "worst_case": min((v.get("net_pnl") or 0) for v in results.values()),
         "reminder": (
-            "A grid earns in the ranging case and loses in the trending cases. "
-            "Read 'down' as 'how much would I lose if it just kept falling' — that "
-            "is the risk you are accepting by running one."
+            "Both strategies earn when price oscillates and lose when it trends. "
+            "Read 'down' as 'what would I lose if it just kept falling' — that is "
+            "the risk you accept by running this. Compare 'net_pnl' against "
+            "fees_paid: if fees are a large share of gross, renegotiate the ¥5 "
+            "minimum before tuning anything else."
         ),
     }
 
@@ -673,11 +688,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tail", type=int, default=20)
     sp.set_defaults(func=cmd_audit)
 
-    sp = sub.add_parser("simulate", help="run the grid over a synthetic price path (offline, no broker)")
+    sp = sub.add_parser("simulate", help="run a strategy over a synthetic price path (offline, no broker)")
+    sp.add_argument("--strategy", choices=["grid", "t"], default="grid",
+                    help="which shipped strategy to simulate")
     sp.add_argument("--code", default="513050")
-    sp.add_argument("--base", type=float, default=1.092, help="anchor price")
-    sp.add_argument("--spacing", type=float, default=3.0, help="%% between levels")
-    sp.add_argument("--qty", type=int, default=2800, help="shares per level")
+    sp.add_argument("--base", type=float, default=1.092, help="anchor/start price")
+    sp.add_argument("--spacing", type=float, default=3.0, help="grid: %% between levels")
+    sp.add_argument("--trigger", type=float, default=1.5, help="t: %% move from reference to open a leg")
+    sp.add_argument("--take-profit", type=float, default=1.5, dest="take_profit",
+                    help="t: %% move to close a leg")
+    sp.add_argument("--t0", action=argparse.BooleanOptionalAction, default=True,
+                    help="t: fund is T+0 (allows 正T); use --no-t0 for T+1")
+    sp.add_argument("--qty", type=int, default=2800, help="grid: shares per level; t: shares per leg")
     sp.add_argument("--levels-up", type=int, default=4, dest="levels_up")
     sp.add_argument("--levels-down", type=int, default=4, dest="levels_down")
     sp.add_argument("--cash", type=float, default=50000.0, help="starting cash")
@@ -692,7 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-min-commission", action="store_true", dest="no_min_commission",
                     help="model the case where the broker waives the ¥5 minimum ('免5')")
     sp.add_argument("--compare-fees", action="store_true", dest="compare_fees",
-                    help="run with and without the minimum fee, side by side")
+                    help="grid only: run with and without the minimum fee, side by side")
     sp.add_argument("--seed", type=int, default=7)
     sp.set_defaults(func=cmd_simulate)
 

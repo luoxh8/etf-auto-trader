@@ -178,29 +178,24 @@ class SimResult:
         }
 
 
-def simulate_grid(
+def simulate_strategy(
+    strategy,
     code: str = "513050",
     base_price: float = 1.092,
-    spacing_pct: float = 3.0,
-    qty_per_level: int = 2800,
-    levels_up: int = 4,
-    levels_down: int = 4,
     starting_cash: float = 50000.0,
     starting_position: int = 18000,
     prices: Optional[List[float]] = None,
     scenario: str = "range",
     ticks: int = 480,
     cost: Optional[CostModel] = None,
-    allowed_codes: Optional[List[str]] = None,
     max_position_pct: float = 90.0,
     drift_annual: float = 2.0,
     seed: int = 7,
 ) -> SimResult:
-    """Run the real GridStrategy + RiskGuard against a price path.
+    """Run ANY strategy object over a price path with real costs and the real guard.
 
-    Returns a SimResult. Fees are charged per fill and deducted from cash, so
-    `net_pnl` is already net of the ¥5 minimum commission — which is the number
-    that decides whether a small-account grid is viable at all.
+    Shared by the grid and the intraday-T simulator so both are measured the same
+    way. ``strategy`` is the shipped class — not a re-implementation.
     """
     cost = cost or CostModel()
     prices = prices or make_price_path(
@@ -217,17 +212,11 @@ def simulate_grid(
                  "available": starting_position, "cost": base_price}
             ],
         },
-        t0=True,   # the fund under test is T+0, as 513050 is
+        t0=True,   # 513050-class funds are T+0
     )
     broker.connect()
 
-    strategy = GridStrategy(
-        code=code, base_price=base_price, spacing_pct=spacing_pct,
-        levels_up=levels_up, levels_down=levels_down, qty_per_level=qty_per_level,
-    )
-
-    guard = RiskGuard(_GuardConfig(allowed_codes or [code], max_position_pct))
-
+    guard = RiskGuard(_GuardConfig([code], max_position_pct))
     starting_equity = round(starting_cash + starting_position * base_price, 2)
     result = SimResult(
         scenario=scenario, ticks=len(prices), start_price=base_price,
@@ -238,6 +227,7 @@ def simulate_grid(
 
     for px in prices:
         broker.set_price(code, px)
+        pos = broker.position_map().get(code)
         ctx = StrategyContext(
             quotes=broker.quote([code]),
             positions=broker.position_map(),
@@ -263,10 +253,9 @@ def simulate_grid(
                 continue
 
             fee = cost.fee(decision.amount)
-            broker.cash = round(broker.cash - fee, 2)     # charge the fee
+            broker.cash = round(broker.cash - fee, 2)
             result.fees_paid = round(result.fees_paid + fee, 2)
             result.filled_notional = round(result.filled_notional + decision.amount, 2)
-
             if decision.req.side == SIDE_BUY:
                 result.buys += 1
                 open_buys += 1
@@ -276,21 +265,81 @@ def simulate_grid(
                     result.round_trips += 1
                     open_buys -= 1
 
-        # mark to market
         p = broker.position_map().get(code)
         equity = broker.cash + (p.qty * px if p else 0.0)
         result.equity_curve.append(round(equity, 2))
 
-    # max drawdown on the equity curve
     peak = result.equity_curve[0] if result.equity_curve else starting_equity
     worst = 0.0
     for e in result.equity_curve:
         peak = max(peak, e)
         if peak > 0:
-            dd = (peak - e) / peak * 100
-            worst = max(worst, dd)
+            worst = max(worst, (peak - e) / peak * 100)
     result.max_drawdown_pct = round(worst, 2)
     return result
+
+
+def simulate_t(
+    code: str = "513050",
+    base_price: float = 1.092,
+    qty: int = 2800,
+    trigger_pct: float = 1.5,
+    take_profit_pct: float = 1.5,
+    t0: bool = True,
+    max_legs_per_day: int = 20,
+    scenario: str = "range",
+    **kwargs,
+) -> SimResult:
+    """Simulate the intraday-T strategy over ONE session.
+
+    `max_legs_per_day` is raised from its live default of 2 because a simulation
+    stands in for a whole path; the live cap exists to stop a runaway day.
+    """
+    from .strategies.t_intraday import IntradayTStrategy
+
+    strategy = IntradayTStrategy(
+        code=code, qty=qty, trigger_pct=trigger_pct,
+        take_profit_pct=take_profit_pct, t0=t0, max_legs_per_day=max_legs_per_day,
+    )
+    return simulate_strategy(
+        strategy, code=code, base_price=base_price, scenario=scenario, **kwargs
+    )
+
+
+def simulate_grid(
+    code: str = "513050",
+    base_price: float = 1.092,
+    spacing_pct: float = 3.0,
+    qty_per_level: int = 2800,
+    levels_up: int = 4,
+    levels_down: int = 4,
+    starting_cash: float = 50000.0,
+    starting_position: int = 18000,
+    prices: Optional[List[float]] = None,
+    scenario: str = "range",
+    ticks: int = 480,
+    cost: Optional[CostModel] = None,
+    allowed_codes: Optional[List[str]] = None,
+    max_position_pct: float = 90.0,
+    drift_annual: float = 2.0,
+    seed: int = 7,
+) -> SimResult:
+    """Run the real GridStrategy + RiskGuard against a price path.
+
+    Fees are charged per fill and deducted from cash, so `net_pnl` is already
+    net of the ¥5 minimum commission — the number that decides whether a
+    small-account grid is viable at all.
+    """
+    strategy = GridStrategy(
+        code=code, base_price=base_price, spacing_pct=spacing_pct,
+        levels_up=levels_up, levels_down=levels_down, qty_per_level=qty_per_level,
+    )
+    return simulate_strategy(
+        strategy, code=code, base_price=base_price,
+        starting_cash=starting_cash, starting_position=starting_position,
+        prices=prices, scenario=scenario, ticks=ticks, cost=cost,
+        max_position_pct=max_position_pct, drift_annual=drift_annual, seed=seed,
+    )
 
 
 class _GuardConfig:

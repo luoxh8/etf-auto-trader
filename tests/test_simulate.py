@@ -113,3 +113,30 @@ def test_trending_regimes_are_where_a_grid_loses():
                   starting_cash=50000.0, starting_position=18000, ticks=480, seed=7)
     down = simulate_grid(scenario="down", **common)
     assert down.net_pnl < 0, "a grid that buys into a decline must show a loss"
+
+
+# ---- the T strategy in the simulator ------------------------------------
+
+def test_simulate_t_runs_and_trades():
+    from etfa.simulate import simulate_t
+
+    res = simulate_t(base_price=1.092, qty=2800, trigger_pct=1.0, take_profit_pct=1.0,
+                     scenario="range", ticks=480, starting_position=18000)
+    assert res.buys > 0 or res.sells > 0, "the T strategy never traded"
+    assert res.ticks == 480
+    assert res.equity_curve
+
+
+def test_simulate_t_fees_are_charged_per_leg():
+    """Every leg pays the ¥5 floor, so fees must scale with the leg count."""
+    from etfa.simulate import simulate_t
+
+    res = simulate_t(base_price=1.092, qty=2800, trigger_pct=1.0, take_profit_pct=1.0,
+                     scenario="range", ticks=480, starting_position=18000,
+                     max_legs_per_day=50)
+    legs = res.buys + res.sells
+    assert legs >= 4, f"expected several legs, got {legs}"
+    # at least ¥5 per leg (the floor), so fees >= 5 * legs * 0.9 (allow rounding)
+    assert res.fees_paid >= 5.0 * legs * 0.9, (
+        f"fees {res.fees_paid} look too low for {legs} legs"
+    )

@@ -104,3 +104,61 @@ def test_t_caps_legs_per_day():
     s.plan(ctx(price=1.00, sellable=8000))   # close leg 1 -> legs_done=1
     assert s.legs_done == 1
     assert s.plan(ctx(price=1.02, sellable=8000)) == []  # cap reached
+
+
+# ---- the "stuck leg" regression -----------------------------------------
+
+def test_t_leg_times_out_when_the_target_never_comes():
+    """A 反T sell into a rally never sees its buy-back price. Without a time stop
+    the leg stays open forever and the strategy does nothing all day — the 'T飞'
+    risk. This is the regression that `simulate --strategy t` exposed."""
+    s = IntradayTStrategy(code="513050", qty=1000, trigger_pct=1.0,
+                          take_profit_pct=1.0, max_leg_ticks=3, stop_loss_pct=99.0)
+    s.plan(ctx(price=1.00, sellable=9000))            # reference
+    sell = s.plan(ctx(price=1.02, sellable=9000))     # open 反T sell
+    assert [r.side for r in sell] == [SIDE_SELL]
+
+    # price keeps rising: take-profit (a 1% pullback) never arrives
+    for px in (1.03, 1.04, 1.05):
+        intents = s.plan(ctx(price=px, sellable=8000))
+    # after max_leg_ticks observations the leg must be force-closed
+    closes = [r for r in intents if r.side == SIDE_BUY]
+    assert closes, "the stuck leg was never force-closed"
+    assert s.open_leg is None
+    assert s.legs_done == 1
+
+
+def test_t_is_not_stuck_forever_across_a_monotonic_rise():
+    """End-to-end: with a rising path the strategy must keep operating, not
+    freeze on the first leg (it did, before the time stop existed)."""
+    from etfa.simulate import simulate_t
+
+    res = simulate_t(base_price=1.092, qty=2800, trigger_pct=1.0, take_profit_pct=1.0,
+                     scenario="up", ticks=480, starting_position=18000, max_legs_per_day=50)
+    assert res.sells >= 2, f"t strategy froze after {res.sells} sells"
+    assert res.buys >= 2, "the t strategy never completed a leg in a rally"
+    assert res.round_trips >= 2
+
+
+def test_t_stop_loss_closes_a_losing_leg():
+    s = IntradayTStrategy(code="513050", qty=1000, trigger_pct=1.0,
+                          take_profit_pct=1.0, max_leg_ticks=999, stop_loss_pct=2.0)
+    s.plan(ctx(price=1.00, sellable=9000))           # reference
+    buy = s.plan(ctx(price=0.98, sellable=9000))     # open 正T buy (down 2%)
+    assert [r.side for r in buy] == [SIDE_BUY]
+    # on a T+0 fund the shares just bought are sellable, so a stop loss can exit
+    intents = s.plan(ctx(price=0.960, sellable=10000))
+    assert any(r.side == SIDE_SELL for r in intents), "stop loss never fired"
+    assert s.open_leg is None
+
+
+def test_t_cannot_close_a_leg_it_cannot_fill():
+    """A 正T leg on a T+1 fund cannot be sold the same day, so the leg must stay
+    open rather than emitting an order the broker would reject."""
+    s = IntradayTStrategy(code="513050", qty=1000, trigger_pct=1.0,
+                          take_profit_pct=1.0, stop_loss_pct=2.0)
+    s.plan(ctx(price=1.00, sellable=9000))
+    s.plan(ctx(price=0.98, sellable=9000))           # 正T buy
+    # nothing sellable (today's buy has not settled)
+    assert s.plan(ctx(price=1.00, sellable=0)) == []
+    assert s.open_leg is not None                     # leg correctly still open
