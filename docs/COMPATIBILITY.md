@@ -95,10 +95,18 @@ for window in self._app.windows(class_name="#32770", visible_only=True):
 `ths` 返回的是通用 `ClientTrader`。
 
 **`ths` 是内置通用配置**（`client.create('ths')` 直接返回一个类），自带硬编码期望值：
-`TITLE = '网上股票交易系统5.0'`、
-`BALANCE_CONTROL_ID_GROUP = {资金余额:1012, 可用金额:1016, 可取金额:1017, 股票市值:1014, 总资产:1015}`、
-`TRADE_SECURITY_CONTROL_ID=1032` / `TRADE_PRICE_CONTROL_ID=1033` / `TRADE_AMOUNT_CONTROL_ID=1034`。
-**窗口标题和控件 ID 都是硬编码的** —— 这正是贴牌客户端最可能对不上的地方。
+
+| 配置项 | 值 | 对本项目的意义 |
+|---|---|---|
+| `TITLE` | `'网上股票交易系统5.0'` | 窗口标题；**不匹配时 connect() 会关窗口**（见上节） |
+| `BALANCE_CONTROL_ID_GROUP` | `资金余额:1012`、`可用金额:1016`、`可取金额:1017`、`股票市值:1014`、`总资产:1015` | 余额只有这 **5 列**（**没有冻结金额**）→ 我们把它列为**可选**字段 |
+| `CANCEL_ENTRUST_ENTRUST_FIELD` | `'合同编号'` | **撤单按「合同编号」匹配，不是「委托编号」** → 适配器用运行时读到的该列作为 order id |
+| `GRID_DTYPE` | `操作日期 / 委托编号 / 申请编号 / 合同编号 / 证券代码 / 股东代码 / 资金帐号 / 资金帐户 / 发生日期` | 客户端表格的列（多为字符串） |
+| 控件 ID | `TRADE_SECURITY=1032`、`TRADE_PRICE=1033`、`TRADE_AMOUNT=1034`、`COMMON_GRID=1047`、`TRADE_SUBMIT=1006` | 贴牌客户端最可能不一致处 |
+
+**契约测试**：`tests/test_easytrader_contract.py` 直接对**真实 easytrader** 断言上面这些，
+所以 easytrader 升级若改变任意一项，测试会立刻失败，而不是等到用户实盘下单才暴露。
+它已经据此抓出两个真实缺陷（漏 `可取金额`、撤单匹配 `合同编号`）。
 
 ## 两个由客户端能力决定的功能限制
 
